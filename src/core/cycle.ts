@@ -694,20 +694,32 @@ interface SyncPhaseResult extends PhaseResult {
 }
 
 /**
- * Resolve the source id for a brain directory by looking up the sources
- * table. Returns undefined when no registered source matches (falls back
- * to pre-v0.18 global config.sync.* keys).
+ * Resolve the source id + config for a brain directory by looking up the
+ * sources table. Returns undefined when no registered source matches (falls
+ * back to pre-v0.18 global config.sync.* keys).
+ *
+ * v0.40.9.0 (A1 from /plan-eng-review): also returns the parsed config so
+ * the autopilot daemon path can honor per-source `cfg.strategy` and
+ * `cfg.excludePatterns` — closes the latent gap where `gbrain sync --all`
+ * read these fields but the daemon's `runPhaseSync` did not, leaving the
+ * autopilot loop unaware of policy that `sync --all` honored.
  */
 async function resolveSourceForDir(
   engine: BrainEngine,
   brainDir: string,
-): Promise<string | undefined> {
+): Promise<{ id: string; config: Record<string, unknown> } | undefined> {
   try {
-    const rows = await engine.executeRaw<{ id: string }>(
-      `SELECT id FROM sources WHERE local_path = $1 LIMIT 1`,
+    const rows = await engine.executeRaw<{ id: string; config: unknown }>(
+      `SELECT id, config FROM sources WHERE local_path = $1 LIMIT 1`,
       [brainDir],
     );
-    return rows[0]?.id;
+    const row = rows[0];
+    if (!row) return undefined;
+    const parsedConfig: Record<string, unknown> =
+      typeof row.config === 'string'
+        ? (JSON.parse(row.config as string) as Record<string, unknown>)
+        : ((row.config ?? {}) as Record<string, unknown>);
+    return { id: row.id, config: parsedConfig };
   } catch {
     // sources table might not exist on very old brains — fall through.
     return undefined;
@@ -762,7 +774,18 @@ async function runPhaseSync(
     // Resolve the per-source id so sync reads source-scoped last_commit
     // instead of the global config key. The global key can drift out of
     // git history (force push, GC) causing a full reimport of all files.
-    const sourceId = await resolveSourceForDir(engine, brainDir);
+    //
+    // v0.40.9.0 A1: also pull cfg.strategy + cfg.excludePatterns from the
+    // source row and thread them. Pre-v0.40.9.0 the autopilot daemon path
+    // silently ignored both, so per-source policy that `sync --all`
+    // honored (strategy / excludes set via raw SQL or `sources update`)
+    // didn't apply when autopilot ran the same source.
+    const source = await resolveSourceForDir(engine, brainDir);
+    const sourceId = source?.id;
+    const cfg = (source?.config ?? {}) as {
+      strategy?: 'markdown' | 'code' | 'auto';
+      excludePatterns?: string[];
+    };
     const result = await performSync(engine, {
       repoPath: brainDir,
       sourceId,
@@ -772,6 +795,9 @@ async function runPhaseSync(
       noExtract: willRunExtractPhase,      // dedupe ONLY when cycle's extract phase will also run.
                                            // If extract isn't scheduled (e.g. `gbrain dream --phase sync`),
                                            // sync's inline extract still runs to preserve prior behavior.
+      // v0.40.9.0 A1 — per-source policy threading:
+      strategy: cfg.strategy,
+      excludePatterns: cfg.excludePatterns,
     });
     const syncedCount = result.added + result.modified;
     return {
@@ -1482,7 +1508,8 @@ export async function runCycle(
         // already-resolved cycle scope; sourceId defaults to 'default' when
         // the sources table doesn't recognize this brainDir (pre-multi-
         // source installs).
-        const xfSourceId = (await resolveSourceForDir(engine, opts.brainDir)) ?? 'default';
+        const xfSource = await resolveSourceForDir(engine, opts.brainDir);
+        const xfSourceId = xfSource?.id ?? 'default';
         const { result, duration_ms } = await timePhase(() =>
           runPhaseExtractFacts(engine, opts.brainDir, xfSourceId, dryRun, syncPagesAffected));
         result.duration_ms = duration_ms;
@@ -1525,7 +1552,8 @@ export async function runCycle(
       } else {
         progress.start('cycle.extract_atoms');
         const { runPhaseExtractAtoms } = await import('./cycle/extract-atoms.ts');
-        const xaSourceId = (await resolveSourceForDir(engine, opts.brainDir)) ?? 'default';
+        const xaSource = await resolveSourceForDir(engine, opts.brainDir);
+        const xaSourceId = xaSource?.id ?? 'default';
         // v0.41.2.1 (D9 #5): union sync + synthesize affected slugs so the
         // incremental discovery path doesn't miss pages just-written by the
         // synthesize phase that ran earlier in the same cycle.
@@ -1724,7 +1752,8 @@ export async function runCycle(
       if (engine) {
         const cfgMod = await import('./config.ts');
         const calibrationConfig = cfgMod.loadConfig() ?? ({} as ReturnType<typeof cfgMod.loadConfig> & object);
-        const calibrationSourceId = await resolveSourceForDir(engine, opts.brainDir);
+        const calibrationSource = await resolveSourceForDir(engine, opts.brainDir);
+        const calibrationSourceId = calibrationSource?.id;
         const calibrationCtx = {
           engine,
           config: calibrationConfig,

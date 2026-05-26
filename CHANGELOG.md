@@ -2,6 +2,93 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.19.0] - 2026-05-27
+
+**Stop indexing files you didn't want indexed.** Drop a `.gbrainignore` at any repo root and gbrain skips data directories, parquet files, scratch notebooks — anything you'd put in `.gitignore` but for the brain. Three layers stack additively: the committed dotfile, persistent per-source patterns on `sources.config.excludePatterns`, and a one-shot `--exclude` CLI flag. Full gitignore parity via the [`ignore`](https://www.npmjs.com/package/ignore) npm lib (same parser ESLint and Prettier use), so your existing muscle memory transfers.
+
+The walker prunes excluded directories at descent (not just emit), so a `data/` exclusion saves the IO of walking the whole subtree. When a `!negation` pattern exists anywhere in the merged set, the optimization falls back to per-file checks so a `data/* + !data/keep.md` pattern correctly rescues `keep.md`.
+
+When patterns change between syncs, an orphan-cleanup pass reaps pages whose paths no longer match the policy. A 50%-or-1000-page safety guard refuses runaway cleanups (typo `**` patterns) without an explicit `--reconcile-excludes --yes`. The autopilot daemon now honors `cfg.excludePatterns` + `cfg.strategy` per source — closes the pre-v0.40.9.0 gap where `sync --all` respected these fields but the cycle daemon silently ignored them.
+
+### How to take advantage of v0.40.9.0
+
+Most users: drop `.gbrainignore` at your repo root with the directories you want gbrain to skip. Commit it. Run `/sync-gbrain` or `gbrain sync --all` and the new policy applies. The orphan-cleanup pass reaps any pre-existing pages from the now-excluded paths on the next sync.
+
+Persistent per-source policy (for sources without a checked-in dotfile, or when you want exclusions out of band):
+```bash
+gbrain sources add my-repo --path /path --exclude 'data/' --exclude '*.parquet'
+gbrain sources update my-repo --exclude 'fixtures/' --exclude 'cache/'
+gbrain sources update my-repo --clear-excludes
+```
+
+Ad-hoc rescue / one-off override:
+```bash
+gbrain sync --source my-repo --exclude '!data/keep.md'
+```
+
+When the safety guard fires (more than 50% of pages would be deleted, or more than 1000 absolute), gbrain refuses and prints the recovery command. Without `--reconcile-excludes --yes` the hash stays unset and the same warning fires on every sync until you either fix your patterns or explicitly accept the destructive cleanup.
+
+### Itemized changes
+
+#### New module + dependency
+
+- **`src/core/gbrainignore.ts` (new, ~280 LOC).** `loadGbrainignore(repoPath)` reads the dotfile with mtime-based cache invalidation (autopilot daemon picks up edits without restart). `resolveExclusions(opts)` merges the three layers in order (dotfile → source.config → cli, last wins per gitignore semantics), returns `{matcher, patterns, safeForDescentPrune, patternsHash}`. SHA-8 of the canonical pattern list backs the A2 reconciliation hash gate. `safeForDescentPrune` flips false on any `!` pattern so the walker falls back to per-file checks correctly.
+- **`package.json` — added `ignore@^7.0.5`.** MIT, ~17KB packed, zero transitive deps. Same gitignore parser ESLint, Prettier, and Husky use.
+
+#### Sync wiring (4 call sites)
+
+- **`src/commands/sync.ts:performSyncInner` — load source config once + build matcher at entry.** Single SELECT replaces the duplicate config load that the existing `remote_url` branch did. Matcher reaches the incremental-diff filter site, the un-syncable cleanup, and the reconciliation pass.
+- **`src/commands/sync.ts:performFullSync` — rebuilds the matcher (config + dotfile + cli excludes) and threads it through to `runImport` so the walker prunes excluded dirs at descent.**
+- **`src/commands/sync.ts:estimateSyncAllCost` — cost-preview walker now honors per-source excludes** so the preview count matches what the actual sync will index. Pre-fix the preview overcounted because it ignored exclusion policy.
+- **`src/commands/sync.ts:runOne` (sync --all fan-out) — reads `cfg.excludePatterns` per source row alongside `cfg.strategy`. Per-source CLI excludes are passed via `opts.excludePatterns` so a user running `gbrain sync --all --exclude tmp/` applies that flag uniformly across sources.**
+- **`src/commands/import.ts:collectSyncableFiles` — extended `CollectOpts` with `ignoreMatcher?`.** Walker checks `matcher.ignores(relPath + '/')` at descent (only when `safeForDescentPrune` is true) and `matcher.ignores(relPath)` at emit. Both checks normalize backslashes for Windows path safety.
+- **`src/commands/import.ts:runImport` — accepts `opts.ignoreMatcher` and threads it to `collectSyncableFiles`.** Direct `gbrain import <dir>` callers without an opts.ignoreMatcher get pre-v0.40.9.0 behavior (no path-based exclusion).
+
+#### Orphan-page reconciliation (A2)
+
+- **`src/commands/sync.ts:reconcileExcludesIfNeeded` (new helper).** Stream-enumerates pages for the current source in 1000-row batches (mirrors the `reindex.ts` pagination pattern — bounded memory regardless of source size). For each page with a non-null `source_path`, runs `matcher.ignores(rel)` to decide deletion. Safety guard refuses to delete when matched > 50% of total OR matched > 1000 absolute. Hash is NOT advanced on a tripped guard so the same warning fires on every subsequent sync until the user fixes patterns or passes `--reconcile-excludes --yes`. Best-effort posture — failure during the pass is logged but never unwinds the primary sync result.
+- **`src/commands/sync.ts:persistExcludesHash` (new helper).** JSONB merge to `sources.config.excludePatternsHash`. Single UPDATE statement, best-effort (a missed write just means the next sync re-runs the enumeration — no correctness impact, mild IO cost).
+- **Reconciliation hooks at three call sites:** incremental sync end, `up_to_date` early return (patterns may have changed even with no git delta), `totalChanges === 0` mid-flow return. Full-sync gets its own call inside `performFullSync` (pre-existing direct-INSERT orphans are reaped here).
+
+#### CLI surface
+
+- **`gbrain sync` flags.** `--exclude <glob>` repeatable; `--reconcile-excludes --yes` bypasses the 50% / 1000-page safety guard.
+- **`gbrain sources add --exclude <glob>` (repeatable).** Persists to `sources.config.excludePatterns`. Sanitized to non-empty strings, capped at 200 patterns.
+- **`gbrain sources update <id> [--name N] [--strategy markdown|code|auto] [--exclude <glob> ...] [--clear-excludes]`.** New subcommand. `--exclude` appends with dedup; `--clear-excludes` resets to empty (and invalidates the reconciliation hash so the next sync re-evaluates the page set). Mutually exclusive with `--exclude` in the same invocation.
+
+#### Source ops (sources-ops.ts)
+
+- **`AddSourceOpts.excludePatterns?: string[]` — wired through both Path A (URL clone) and Path B (local path) so behavior is symmetric.**
+- **`UpdateSourceOpts` (new) + `updateSource()` (new).** Atomic JSONB merge. Append-with-dedup semantics for `excludePatterns`; clear-excludes wipes `excludePatterns` AND `excludePatternsHash`. Throws `SourceOpError` with the new `invalid_update_combination` code when caller passes `excludePatterns + clearExcludes` together.
+
+#### Autopilot daemon (A1 from /plan-eng-review)
+
+- **`src/core/cycle.ts:resolveSourceForDir` — returns `{id, config}` instead of just `id`.** Saves the second SELECT on the cycle hot path and lets `runPhaseSync` read per-source policy.
+- **`src/core/cycle.ts:runPhaseSync` — threads `cfg.strategy` AND `cfg.excludePatterns` to `performSync`.** Closes the latent gap where `sync --all` honored these fields but the autopilot cycle silently ignored them. The same wave bakes the strategy-threading fix that should have shipped in v0.40 — calls out as the smallest atomic correctness win attached to the larger exclusion feature.
+
+#### Doctor check
+
+- **`src/commands/doctor.ts:checkGbrainignoreHealth` (new).** Per-source rollup: counts pattern lines, warns when over the 1000-line cap, warns on unreadable files. Silent ok when no source has a dotfile. Surfaces in the standard `gbrain doctor` output between `source_routing_health` and `oauth_confidential_client_health`. 3 leaf cases pinned in `test/doctor-behavioral.test.ts`.
+
+#### Tests (4 new files + 1 extension)
+
+- **`test/gbrainignore.test.ts` (new, 22 cases).** `loadGbrainignore` happy paths + missing / empty / comments / mtime-invalidation. `resolveExclusions` merge semantics, negation handling, safeForDescentPrune flag, hash stability, defensive normalization (backslashes, leading slash, absolute paths).
+- **`test/sync-exclude.test.ts` (new, 15 cases).** PGLite-backed end-to-end. The 4 REGRESSION-CRITICAL cases (IRON RULE per /plan-eng-review): negation-aware fallback walks dirs when `!` is present, 50% safety guard blocks deletion without forceReconcile, forceReconcile=true bypasses the guard, 1000-row batched reconciliation. Plus dotfile + CLI flag + sources.config layer composition, hash-fast-path no-op, and source.config.excludePatterns sanity.
+- **`test/sources-exclude.test.ts` (new, 10 cases).** `addSource --exclude` single / multiple / backward-compat / defensive filtering / 200-cap / URL-source symmetry. `updateSource` name + strategy + missing-source + invalid-id errors.
+- **`test/doctor-behavioral.test.ts` extension (3 new cases).** `checkGbrainignoreHealth` covering ok-silent, ok-with-counts, and warn-on-truncation.
+- **`test/gbrainignore.test.ts` — `loadGbrainignore` mtime-invalidation case** is the C2 regression that catches autopilot-daemon staleness if a future refactor accidentally drops the stat() check.
+
+#### Docs
+
+- **`docs/guides/sync-filtering.md` — new "User-configurable exclusion (v0.40.9.0)" section** documenting the three layers, merge order, the gitignore `dir/` vs `dir/*` rescue gotcha, the safety-guard message, and the storage-tier-vs-exclusion comparison. Notes the autopilot daemon now honors per-source policy.
+
+### Honest notes
+
+The original /plan-eng-review plan listed an extension to `pruneDir(name, parentDir?, dirExcludes?)` in `src/core/sync.ts`. Implementation found that `pruneDir` operates on single segment names, not relative paths — descent-prune is inherently path-aware so the logic lives in the walker's `walk()` function in `src/commands/import.ts`, not in `pruneDir`. The `pruneDir` extension was cancelled with a one-line note in the plan's todo list. Final file count is 16 (one over the planned 15) because the cycle.ts edit added during the eng review (A1 fix) is its own file.
+
+One follow-up TODO filed: `sources.config` JSONB reads use untyped casts matching the existing `cfg.strategy` pattern. A zod schema for the whole source config shape would catch malformed rows at parse time instead of crash time. Deferred to a future wave; not load-bearing because the writers (sources add / sources update) are typed at entry.
+
+The autopilot daemon's `runPhaseSync` doesn't accept its own `--exclude` flag for ad-hoc fan-out — the daemon reads `cfg.excludePatterns` per source from the DB. A user who wants a one-off daemon-side exclusion would need a wrapper script or a `sources update --exclude` write before triggering the cycle. Daemon-side CLI flag plumbing is a follow-up if anyone hits the use case.
 ## [0.41.18.0] - 2026-05-26
 
 **You can now run one command and have gbrain tell you exactly what's
@@ -2445,7 +2532,6 @@ If `code-def` returns nothing on a table you know exists in a sync'd `.sql` file
 - **D4** (CHUNKER_VERSION): bump 4→5 + wire post-upgrade reembed prompt. Dropped by D6 (no longer needed without JSDoc).
 - **D5** (JSDoc extraction): preceding-sibling AST scan. Dropped by D6.
 - **D6** (scope correction, post-codex): strip JSDoc + CHUNKER_VERSION + reembed-prompt. Keep `.sql` + add SQL symbol-name extraction. Driven by codex's F2 finding that SQL chunking without symbol extraction is "just searchable text," not code intelligence.
-
 ## [0.40.8.1] - 2026-05-23
 
 **The README and tutorials are rewritten for someone who has never touched GBrain.** The front-door docs now read as a story you can understand cold: what GBrain does, what it looks like, how to install it, two real walkthroughs that take you from zero to a working brain. No internal jargon, no version archaeology, no assumed context.
@@ -15443,9 +15529,13 @@ Tonight's production upgrade surfaced eleven bugs. Two of them — Bug 1 (the mi
 ## **Silent binaries are dead. Every bulk action now heartbeats.**
 ## **Agents can tell the difference between "working" and "hung."**
 
-`gbrain doctor` on a 52K-page brain used to sit silent for 10+ minutes and then get killed by an agent timeout. The checks always completed when run by hand, but stdout buffered and agents saw nothing. The same pattern hit `embed`, `sync`, `import`, `extract`, `migrate`, and every orchestrator that shelled out to them — progress either went to stdout with `` rewrites that collapse when piped, or nowhere at all. v0.15.2 routes every bulk action through one shared reporter. Non-TTY default is plain human lines on stderr, one line per event. Agents that want structured progress flip `--progress-json` and get one JSON object per line.
+`gbrain doctor` on a 52K-page brain used to sit silent for 10+ minutes and then get killed by an agent timeout. The checks always completed when run by hand, but stdout buffered and agents saw nothing. The same pattern hit `embed`, `sync`, `import`, `extract`, `migrate`, and every orchestrator that shelled out to them — progress either went to stdout with `
+` rewrites that collapse when piped, or nowhere at all. v0.15.2 routes every bulk action through one shared reporter. Non-TTY default is plain human lines on stderr, one line per event. Agents that want structured progress flip `--progress-json` and get one JSON object per line.
 
-Progress events never touch stdout. Data and final summaries still go there. Script you wrote six months ago that parses `gbrain embed` output? Still works. Agent that captures stdout to JSON.parse the result? Now gets clean JSON instead of `1234/52000 pages...` mixed in.
+Progress events never touch stdout. Data and final summaries still go there. Script you wrote six months ago that parses `gbrain embed` output? Still works. Agent that captures stdout to JSON.parse the result? Now gets clean JSON instead of `
+
+
+1234/52000 pages...` mixed in.
 
 ### The numbers that matter
 
@@ -15453,7 +15543,8 @@ Measured on this repo (80 unit test files, 14 E2E test files, real Postgres+pgve
 
 | Metric                                            | BEFORE v0.15.2         | AFTER v0.15.2                          | Δ              |
 |---------------------------------------------------|------------------------|----------------------------------------|----------------|
-| Commands that stream progress                     | 3 (ad-hoc `` stdout) | **14** (reporter, stderr, rate-gated) | **+11**        |
+| Commands that stream progress                     | 3 (ad-hoc `
+` stdout) | **14** (reporter, stderr, rate-gated) | **+11**        |
 | Progress observable when stdout is piped          | **0 of 3**             | **14 of 14**                           | always visible |
 | Canonical JSON event schema                       | none                   | **locked in `docs/progress-events.md`** | stable         |
 | `doctor` silence window on 52K pages              | 10+ min then killed    | **heartbeat every 1s**                 | observable     |
@@ -15466,9 +15557,12 @@ Measured on this repo (80 unit test files, 14 E2E test files, real Postgres+pgve
 |-----------------------|-----------------|----------------------------------------------------------------|
 | `doctor`              | None (blocks)   | Per-check heartbeat, 1s on slow queries                        |
 | `orphans`             | Final summary   | Heartbeat while `NOT EXISTS` scan runs                         |
-| `embed`               | `` stdout     | Per-page stderr, `job.updateProgress` from Minions             |
-| `files sync`          | `` stdout     | Per-file stderr                                                |
-| `export`              | `` stdout     | Per-page stderr (newly in scope)                               |
+| `embed`               | `
+` stdout     | Per-page stderr, `job.updateProgress` from Minions             |
+| `files sync`          | `
+` stdout     | Per-file stderr                                                |
+| `export`              | `
+` stdout     | Per-page stderr (newly in scope)                               |
 | `import`              | Per-100 stdout  | Per-file stderr, rate-gated                                    |
 | `extract` (fs + db)   | Ad-hoc stderr   | Canonical event schema, all paths                              |
 | `sync`                | Final summary   | Per-file ticks across delete/rename/import phases              |
@@ -15508,7 +15602,8 @@ If you run `gbrain` in CI, through a Minion worker, or inside any agent that cap
 ### Itemized changes
 
 #### Reporter (new, `src/core/progress.ts`)
-- Dependency-free. Modes: `auto` (TTY → ``-rewriting; non-TTY → plain lines), `human`, `json` (JSONL on stderr), `quiet`.
+- Dependency-free. Modes: `auto` (TTY → `
+`-rewriting; non-TTY → plain lines), `human`, `json` (JSONL on stderr), `quiet`.
 - Rate gating: emits on whichever fires first: `minIntervalMs` (default 1000) or `minItems` (default `max(10, ceil(total/100))`). Final `tick` where `done === total` always emits.
 - `startHeartbeat(reporter, note)` helper for single long-running queries (doctor's `markdown_body_completeness`, `orphans` anti-join, `repair-jsonb` per-column UPDATE).
 - `child()` composes phase paths, `sync.import.<slug>`, not flat `<slug>`.
@@ -15526,7 +15621,8 @@ If you run `gbrain` in CI, through a Minion worker, or inside any agent that cap
 - Phases use `snake_case.dot.path`. Machine-stable. Agent parsers can group by phase prefix (all `doctor.*` events belong to one run).
 
 #### Backward-compat warnings
-Progress for `embed`, `files`, `export`, `extract`, `import`, `migrate-engine` moved from stdout to stderr. Stdout now carries only final summaries and `--json` payloads. Scripts that parsed `process.stdout` for progress lines (`  1234/52000 pages...`) see empty stdout for those counters; the data they actually want (the final "Embedded N chunks" summary) is still there. Point anything grepping stdout for progress at stderr instead.
+Progress for `embed`, `files`, `export`, `extract`, `import`, `migrate-engine` moved from stdout to stderr. Stdout now carries only final summaries and `--json` payloads. Scripts that parsed `process.stdout` for progress lines (`
+  1234/52000 pages...`) see empty stdout for those counters; the data they actually want (the final "Embedded N chunks" summary) is still there. Point anything grepping stdout for progress at stderr instead.
 
 #### Minion handlers (`src/commands/jobs.ts`)
 - `embed` handler passes `job.updateProgress({done, total, embedded, phase})` as the `onProgress` callback. Primary Minion progress channel is DB-backed, readable via `gbrain jobs get <id>` or the `get_job_progress` MCP op. Stderr from `jobs work` stays coarse for daemon liveness.
@@ -15541,7 +15637,8 @@ Progress for `embed`, `files`, `export`, `extract`, `import`, `migrate-engine` m
 - Post-upgrade timeout bumped 300s → 1800s (30 min). Override via `GBRAIN_POST_UPGRADE_TIMEOUT_MS`. The old 300s cap killed v0.12.0 graph-backfill migrations on 50K+ brains; heartbeat wiring in v0.15.2 makes the long wait observable.
 
 #### CI guard
-- `scripts/check-progress-to-stdout.sh` greps `src/` for `process.stdout.write('...')` and fails `bun run test` if any regression lands.
+- `scripts/check-progress-to-stdout.sh` greps `src/` for `process.stdout.write('
+...')` and fails `bun run test` if any regression lands.
 
 #### Tests
 - New: `test/progress.test.ts` (17 cases — mode resolution, rate gating, EPIPE paths, SIGINT singleton, child phase composition), `test/cli-options.test.ts` (18 cases — flag parsing, `--quiet` skillpack-check collision regression, global-flag strip-and-dispatch), `test/e2e/doctor-progress.test.ts` (3 cases, Tier 1 — spawns the real CLI against a real Postgres, asserts stderr JSONL matches the schema and stdout stays clean).
