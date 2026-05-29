@@ -302,6 +302,27 @@ export async function runPhaseSynthesize(
     // them. Best-effort — a probe that's never run is a normal early state.
     const priorContradictionsBlock = await loadPriorContradictionsBlock(engine);
 
+    // v0.41.x: optionally refresh the corpus from opencode chat history before
+    // discovery, so this machine's recent opencode sessions get synthesized.
+    // Opt-IN (config.opencodeExport) because each new session becomes a
+    // synthesize candidate; only when opencode.db exists here (multi-machine
+    // friendly); skipped for ad-hoc --input runs. Best-effort — an export
+    // failure logs and never aborts the synthesize phase.
+    if (!opts.inputFile && config.corpusDir && config.opencodeExport) {
+      try {
+        const { runOpencodeExport, OPENCODE_DEFAULT_DB } = await import('../opencode-export.ts');
+        const dbPath = config.opencodeDbPath ?? OPENCODE_DEFAULT_DB;
+        if (existsSync(dbPath)) {
+          const exp = await runOpencodeExport({ dbPath, corpusDir: config.corpusDir });
+          if (exp.written > 0) {
+            process.stderr.write(`[dream] opencode-export: refreshed ${exp.written} session(s) into corpus\n`);
+          }
+        }
+      } catch (e) {
+        process.stderr.write(`[dream] opencode-export skipped: ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+    }
+
     // Discover.
     const transcripts = opts.inputFile
       ? loadAdHocTranscript(opts.inputFile, config.minChars, config.excludePatterns, opts.bypassDreamGuard)
@@ -593,6 +614,20 @@ interface SynthConfig {
    * `dream.synthesize.max_chunks_per_transcript`.
    */
   maxChunksPerTranscript: number;
+  /**
+   * v0.41.x: when true, refresh the corpus from opencode chat history before
+   * discovery (so today's opencode sessions get synthesized). Opt-IN —
+   * default false — because every new session becomes a synthesize candidate
+   * (Haiku verdict + maybe Sonnet). Config key
+   * `dream.synthesize.opencode_export`.
+   */
+  opencodeExport: boolean;
+  /**
+   * Optional opencode.db path override. null → the module default
+   * (~/.local/share/opencode/opencode.db). Config key
+   * `dream.synthesize.opencode_db_path`.
+   */
+  opencodeDbPath: string | null;
 }
 
 async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
@@ -621,6 +656,8 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
   const cooldownHoursStr = await engine.getConfig('dream.synthesize.cooldown_hours');
   const maxPromptTokensStr = await engine.getConfig('dream.synthesize.max_prompt_tokens');
   const maxChunksStr = await engine.getConfig('dream.synthesize.max_chunks_per_transcript');
+  const opencodeExportRaw = await engine.getConfig('dream.synthesize.opencode_export');
+  const opencodeDbPath = await engine.getConfig('dream.synthesize.opencode_db_path');
 
   let excludePatterns: string[] = ['medical', 'therapy'];
   if (excludeStr) {
@@ -658,6 +695,8 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
     cooldownHours: cooldownHoursStr ? Math.max(0, parseInt(cooldownHoursStr, 10) || 12) : 12,
     maxPromptTokens,
     maxChunksPerTranscript,
+    opencodeExport: opencodeExportRaw === 'true',
+    opencodeDbPath: opencodeDbPath ?? null,
   };
 }
 
