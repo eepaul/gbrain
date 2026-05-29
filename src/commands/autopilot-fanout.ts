@@ -32,6 +32,7 @@
 
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
+import { localPathPresent } from '../core/source-local-path.ts';
 
 const FULL_CYCLE_FLOOR_MIN = 60;
 
@@ -58,6 +59,9 @@ export interface FanoutResult {
   skipped_fresh: string[];
   /** Source ids beyond the fanoutMax cap (will retry next tick). */
   skipped_cap: string[];
+  /** Source ids whose local_path isn't present on this machine (multi-machine
+   *  brains: the repo lives on another host). Never dispatched here. */
+  skipped_absent: string[];
   /** True when this tick fell back to the legacy single-job path
    *  (no sources rows / engine empty). */
   legacy_fallback: boolean;
@@ -193,10 +197,27 @@ export async function dispatchPerSource(
     } else {
       log(`[dispatch] job #${job.id} autopilot-cycle (legacy single-source)`);
     }
-    return { dispatched: [], skipped_fresh: [], skipped_cap: [], legacy_fallback: true };
+    return { dispatched: [], skipped_fresh: [], skipped_cap: [], skipped_absent: [], legacy_fallback: true };
   }
 
-  const { dispatch, skippedFresh, skippedCap } = selectSourcesForDispatch(sources, opts.fanoutMax);
+  // Multi-machine: drop sources whose repo checkout isn't on this host BEFORE
+  // the freshness/cap selection, so a foreign source never consumes a fan-out
+  // slot. (listAllSources already filtered local_path IS NOT NULL; this filters
+  // local_path-not-present-on-disk.) A manual `gbrain sync --source <id>` still
+  // reclones on demand — this gate is autopilot-only.
+  const presentSources: SourceRow[] = [];
+  const skippedAbsent: SourceRow[] = [];
+  for (const s of sources) {
+    (localPathPresent(s.local_path) ? presentSources : skippedAbsent).push(s);
+  }
+  if (skippedAbsent.length > 0 && opts.jsonMode) {
+    emit(JSON.stringify({
+      event: 'fanout_skipped_absent',
+      source_ids: skippedAbsent.map(s => s.id),
+    }));
+  }
+
+  const { dispatch, skippedFresh, skippedCap } = selectSourcesForDispatch(presentSources, opts.fanoutMax);
 
   const dispatched: string[] = [];
   for (const src of dispatch) {
@@ -265,6 +286,7 @@ export async function dispatchPerSource(
     dispatched,
     skipped_fresh: skippedFresh.map(s => s.id),
     skipped_cap: skippedCap.map(s => s.id),
+    skipped_absent: skippedAbsent.map(s => s.id),
     legacy_fallback: false,
   };
 }

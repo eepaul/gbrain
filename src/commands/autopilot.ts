@@ -442,6 +442,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
           if (await isFederatedV2Enabled(engine)) {
             const { loadAllSources } = await import('../core/sources-load.ts');
+            const { localPathPresent } = await import('../core/source-local-path.ts');
             const sources = await loadAllSources(engine);
             const intervalMs = baseInterval * 1000;
             const now = Date.now();
@@ -450,6 +451,21 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
               const lastSyncMs = src.last_sync_at ? new Date(src.last_sync_at).getTime() : 0;
               const ageMs = now - lastSyncMs;
               if (ageMs < intervalMs) continue; // fresh enough
+              // Multi-machine: skip sources whose repo checkout isn't on this
+              // host. A 'sync' job here can't reach the files (and could trip an
+              // unwanted reclone). Checked after the freshness gate, so it only
+              // fires for STALE foreign sources — a healthy multi-host brain
+              // (foreign sources kept fresh by their owners) stays quiet.
+              if (!localPathPresent(src.local_path)) {
+                if (jsonMode) {
+                  process.stderr.write(JSON.stringify({
+                    event: 'skipped', mode: 'freshness', reason: 'local_path_absent', source_id: src.id,
+                  }) + '\n');
+                } else {
+                  console.log(`[autopilot] skip ${src.id}: local_path not on this machine (${src.local_path})`);
+                }
+                continue;
+              }
               try {
                 const job = await queue.add(
                   'sync',

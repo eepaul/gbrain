@@ -19,12 +19,26 @@ import {
   dispatchPerSource,
 } from '../src/commands/autopilot-fanout.ts';
 import type { SourceRow, BrainEngine } from '../src/core/engine.ts';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
-function src(id: string, last_full_cycle_at?: string | null, extra: Record<string, unknown> = {}): SourceRow {
+// v0.41.x multi-machine source skip: dispatchPerSource now filters sources whose
+// local_path isn't present on this host. Stubbed sources default to a REAL
+// existing directory (os.tmpdir()) so the dispatch tests behave as before;
+// absent-filter tests pass an explicit non-existent path via the 4th arg.
+const PRESENT_DIR = tmpdir();
+const ABSENT_DIR = join(tmpdir(), 'gbrain-fanout-absent-does-not-exist-2f9a1c');
+
+function src(
+  id: string,
+  last_full_cycle_at?: string | null,
+  extra: Record<string, unknown> = {},
+  localPath: string | null = PRESENT_DIR,
+): SourceRow {
   return {
     id,
     name: null,
-    local_path: `/tmp/${id}`,
+    local_path: localPath,
     last_sync_at: null,
     config: {
       ...(last_full_cycle_at !== undefined ? { last_full_cycle_at } : {}),
@@ -305,6 +319,98 @@ describe('dispatchPerSource — integration with stubbed engine + queue', () => 
     const result = await dispatchPerSource(engine, queue, fanoutOpts);
     expect(result.dispatched.length).toBe(0);
     expect(result.skipped_fresh.length).toBe(2);
+    expect(added.length).toBe(0);
+  });
+});
+
+describe('dispatchPerSource — multi-machine local_path absent filter (v0.41.x)', () => {
+  type AddedJob = { name: string; data: unknown; opts: Record<string, unknown> };
+
+  function makeStubs(sources: SourceRow[]) {
+    const added: AddedJob[] = [];
+    let nextId = 100;
+    const engine = {
+      kind: 'postgres' as const,
+      listAllSources: async () => sources,
+    } as unknown as BrainEngine;
+    const queue = {
+      add: async (name: string, data: unknown, addOpts: Record<string, unknown>) => {
+        added.push({ name, data, opts: addOpts });
+        return { id: nextId++ };
+      },
+    } as unknown as Parameters<typeof dispatchPerSource>[1];
+    const events: string[] = [];
+    const fanoutOpts = {
+      repoPath: '/tmp/brain',
+      slot: '2026-05-29T12:00:00.000Z',
+      timeoutMs: 600_000,
+      fanoutMax: 4,
+      jsonMode: true,
+      emit: (line: string) => events.push(line),
+      log: () => {},
+    };
+    return { engine, queue, added, events, fanoutOpts };
+  }
+
+  test('a source whose local_path is absent on this host is skipped, not dispatched', async () => {
+    const { engine, queue, added, fanoutOpts } = makeStubs([
+      src('foreign', undefined, {}, ABSENT_DIR),
+    ]);
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.dispatched).toEqual([]);
+    expect(result.skipped_absent).toEqual(['foreign']);
+    expect(added.length).toBe(0);
+    // Sources exist (length > 0) so this is NOT the legacy single-job fallback.
+    expect(result.legacy_fallback).toBe(false);
+  });
+
+  test('mixed present + absent: only present sources dispatch; absent never consume a cap slot', async () => {
+    const { engine, queue, added, fanoutOpts } = makeStubs([
+      src('foreign-a', undefined, {}, ABSENT_DIR),
+      src('local-1'), // PRESENT_DIR
+      src('foreign-b', undefined, {}, ABSENT_DIR),
+      src('local-2'), // PRESENT_DIR
+    ]);
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.dispatched.sort()).toEqual(['local-1', 'local-2']);
+    expect(result.skipped_absent.sort()).toEqual(['foreign-a', 'foreign-b']);
+    expect(added.length).toBe(2);
+    const sourceIds = added.map(j => (j.data as Record<string, unknown>).source_id).sort();
+    expect(sourceIds).toEqual(['local-1', 'local-2']);
+  });
+
+  test('null local_path is treated as absent (defensive — listAllSources normally filters it)', async () => {
+    const { engine, queue, added, fanoutOpts } = makeStubs([
+      src('null-path', undefined, {}, null),
+      src('present'),
+    ]);
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.dispatched).toEqual(['present']);
+    expect(result.skipped_absent).toEqual(['null-path']);
+    expect(added.length).toBe(1);
+  });
+
+  test('jsonMode emits a fanout_skipped_absent event listing absent source ids', async () => {
+    const { engine, queue, events, fanoutOpts } = makeStubs([
+      src('foreign', undefined, {}, ABSENT_DIR),
+      src('local'),
+    ]);
+    await dispatchPerSource(engine, queue, fanoutOpts);
+    const absentEvent = events.find(e => e.includes('fanout_skipped_absent'));
+    expect(absentEvent).toBeDefined();
+    const parsed = JSON.parse(absentEvent!);
+    expect(parsed.source_ids).toEqual(['foreign']);
+  });
+
+  test('all sources absent: dispatches nothing, no legacy fallback (sources exist but none here)', async () => {
+    const { engine, queue, added, fanoutOpts } = makeStubs([
+      src('foreign-a', undefined, {}, ABSENT_DIR),
+      src('foreign-b', undefined, {}, ABSENT_DIR),
+    ]);
+    const result = await dispatchPerSource(engine, queue, fanoutOpts);
+    expect(result.dispatched).toEqual([]);
+    expect(result.skipped_absent.sort()).toEqual(['foreign-a', 'foreign-b']);
+    expect(result.legacy_fallback).toBe(false);
     expect(added.length).toBe(0);
   });
 });
