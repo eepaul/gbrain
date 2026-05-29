@@ -2,6 +2,53 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.20.0] - 2026-05-29
+
+**Your autopilot stops silently breaking its own writes.** If you run gbrain's autopilot (the background daemon that keeps your brain synced and enriched), there was a bug where, under load, the worker could lose its database connection partway through a cycle. From that point on every link and fact write failed with "connect() has not been called" while the worker kept running. The brain looked healthy but quietly stopped learning (link density stuck low, facts not written). This release makes the long-running daemons (`serve`, `autopilot`, `jobs work`) each hold their own database connection pool, so one part of the process tearing down a connection can no longer break the others.
+
+Two smaller fixes ride along. On multi-machine setups, the autopilot now skips sources whose repo checkout is not on the current machine instead of queuing sync jobs that can only fail. And a new `gbrain opencode-export` command turns your opencode chat history into transcripts the dream-synthesize phase can learn from.
+
+### How to take advantage of v0.41.20.0
+
+Nothing required for the connection fix. After `gbrain upgrade`, it applies to every `gbrain serve`, `gbrain autopilot`, and `gbrain jobs work` process you start. Already-running long-lived processes pick it up on their next restart.
+
+Multi-machine source skip is automatic: a stale source whose `local_path` is not on this host is skipped with an `[autopilot] skip <id>` line instead of a failed sync job. A manual `gbrain sync --source <id>` still reclones a remote-backed source on demand.
+
+To feed opencode chat history into synthesize:
+```bash
+# one-off: export the 50 newest sessions, bound the first run
+gbrain opencode-export --corpus-dir /path/to/corpus --limit 50
+
+# or set the corpus dir once and let the synthesize phase refresh it
+gbrain config set dream.synthesize.session_corpus_dir /path/to/corpus
+gbrain config set dream.synthesize.opencode_export true   # opt-in (synthesize LLM cost)
+```
+The export is incremental, so re-run any time and unchanged sessions skip. The first run on a long history exports everything, which means synthesize will run its significance verdict over all of it (real LLM cost). Bound the first run with `--since 7d` or `--limit N`.
+
+### Itemized changes
+
+#### Connection isolation (the autopilot avalanche fix)
+
+- **`src/cli.ts` `connectEngine`.** Long-running daemons (`serve`, `autopilot`, `jobs work`) now connect in INSTANCE mode (their own `_sql` pool) instead of routing every engine method through the process-global `db.ts` singleton. In module mode, any in-process module-mode disconnect (worker shutdown) or a failed reconnect under a degraded DB cleared the shared singleton mid-life and broke in-flight cycle / extract / facts writes. Short-lived CLI commands stay module mode (single-threaded, disconnect only at exit, and several call `db.getConnection()` directly). PGLite is unaffected because each engine owns its `_db`.
+- **`src/core/daemon-connection-mode.ts` (new).** Pure policy helpers `isInstanceModeDaemon(parsedArgs, engineKind)` and `needsSingletonSeed(parsedArgs, engineKind)`. The worker (`jobs work`) additionally seeds the module singleton because the `integrity` and `repair-jsonb` job handlers call `db.getConnection()` directly. That is one small idle-closing pool in one process, safe under a tight `max_connections`.
+- Tests: `test/daemon-connection-mode.test.ts` (14) and `test/e2e/connection-isolation.test.ts` (2 cases pinning the invariant: an instance-mode engine survives a sibling module-mode disconnect; a module-mode engine throws, which is the exact failure that dropped autopilot writes).
+
+#### Multi-machine source skip
+
+- **`src/core/source-local-path.ts` (new).** `localPathPresent(localPath)` does an exists + is-directory check, fail-soft. Shared by the autopilot freshness loop and the per-source fan-out so the two sites cannot drift.
+- **`src/commands/autopilot.ts` + `src/commands/autopilot-fanout.ts`.** The freshness loop skips a stale source whose `local_path` is not on this host (checked after the freshness gate, so a healthy multi-host brain stays quiet). `dispatchPerSource` filters absent sources before the freshness and cap selection and reports them in a new `skipped_absent` field on `FanoutResult`.
+- Tests: `test/source-local-path.test.ts` (4) plus 5 new absent-filter cases in `test/autopilot-fanout.test.ts`.
+
+#### opencode chat history to synthesize corpus
+
+- **`src/core/opencode-export.ts` (new) + `src/commands/opencode-export.ts` (new).** `gbrain opencode-export [--corpus-dir P] [--db P] [--since DUR|DATE] [--limit N] [--dry-run] [--json]` reads opencode's local SQLite DB read-only and renders each session to a `## User:` / `## Assistant:` markdown transcript at `<corpus>/opencode/YYYY-MM-DD-<session-id>.md`. Incremental via `~/.gbrain/opencode-export-state.json` keyed on `session.time_updated`. Only `type:text` parts render; tool calls and reasoning are excluded. No `dream_generated` marker (these are input transcripts, not dream output), so `discoverTranscripts` picks them up and the synthesize core stays unchanged.
+- **`src/core/cycle/synthesize.ts`.** Opt-in auto-export before discovery, gated on the new `dream.synthesize.opencode_export` config key (default false) plus opencode.db existence on this machine. Best-effort: an export failure logs and never aborts synthesize. New config keys: `dream.synthesize.opencode_export`, `dream.synthesize.opencode_db_path`.
+- Tests: `test/opencode-export.test.ts` (19 cases, pure render helpers + in-memory SQLite orchestration). Validated against a real opencode.db via dry-run and a real single-session write.
+
+#### For contributors
+
+- A `brain-registry.initHostBrain` poolSize fix (the latent twin of the connection-isolation bug, not triggered in single-source / no-mounts setups) is deferred to a follow-up. See TODOS.md.
+
 ## [0.41.19.0] - 2026-05-27
 
 **Stop indexing files you didn't want indexed.** Drop a `.gbrainignore` at any repo root and gbrain skips data directories, parquet files, scratch notebooks — anything you'd put in `.gitignore` but for the brain. Three layers stack additively: the committed dotfile, persistent per-source patterns on `sources.config.excludePatterns`, and a one-shot `--exclude` CLI flag. Full gitignore parity via the [`ignore`](https://www.npmjs.com/package/ignore) npm lib (same parser ESLint and Prettier use), so your existing muscle memory transfers.

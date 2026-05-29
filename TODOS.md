@@ -1,5 +1,21 @@
 # TODOS
 
+## v0.41.20.0 connection-isolation wave follow-up (v0.41.21+)
+
+- **brain-registry.initHostBrain poolSize (P2).** `src/core/brain-registry.ts:initHostBrain`
+  connects the host brain engine WITHOUT `poolSize` (module mode), while
+  `initMountBrain` correctly passes `poolSize: 5` (Codex finding #1 from the
+  mounts wave). This is the latent twin of the v0.41.20.0 connection-isolation
+  bug: a module-mode host engine in the registry shares the global `db.ts`
+  singleton, so `disconnectAll()` would clear it for any concurrent consumer.
+  Not triggered today (solo / no-mounts brains don't instantiate the registry
+  on the cycle hot path, and `disconnectAll` isn't called mid-cycle), so it was
+  deferred from the v0.41.20.0 ship to avoid the untraced multi-engine coupling
+  (the registry's module-mode host init may be the implicit source of the
+  singleton for some direct `db.getConnection()` callers). Fix: give
+  `initHostBrain` the same `poolSize` treatment as `initMountBrain`, and verify
+  no consumer relies on the registry seeding the global singleton.
+
 ## v0.41.18.0 onboard wave follow-ups (v0.42.1+)
 
 - **TODO-A (P2)**: Pack-aware `linkable: boolean` per-type field on schema-pack

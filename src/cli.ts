@@ -35,7 +35,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser']);
+const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'opencode-export']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -920,6 +920,13 @@ async function handleCliOnly(command: string, args: string[]) {
     await runCheckResolvable(args);
     return;
   }
+  if (command === 'opencode-export') {
+    // Opens opencode.db read-only + (when --corpus-dir omitted) its own engine
+    // to read the corpus-dir config key. No daemon — module mode is fine.
+    const { runOpencodeExportCli } = await import('./commands/opencode-export.ts');
+    await runOpencodeExportCli(args);
+    return;
+  }
   if (command === 'mounts') {
     // No DB needed: mounts.json is a local config file. Registry will
     // connect mount engines lazily on first use by op dispatch.
@@ -1737,11 +1744,40 @@ async function connectEngine(opts?: { probeOnly?: boolean }): Promise<BrainEngin
   configureGateway(buildGatewayConfig(config));
 
   const { createEngine } = await import('./core/engine-factory.ts');
-  const engine = await createEngine(toEngineConfig(config));
+  const engineConfig = toEngineConfig(config);
+  const engine = await createEngine(engineConfig);
   const noRetry = process.argv.includes('--no-retry-connect') ||
                   process.env.GBRAIN_NO_RETRY_CONNECT === '1';
-  const { connectWithRetry } = await import('./core/db.ts');
-  await connectWithRetry(engine, toEngineConfig(config), { noRetry });
+  const dbmod = await import('./core/db.ts');
+  const { connectWithRetry } = dbmod;
+
+  // v0.41.x connection-isolation fix (autopilot "connect() has not been
+  // called" avalanche bug class). Long-running daemons run a job/request loop
+  // AND concurrent writes on a single engine; in MODULE mode every
+  // PostgresEngine method falls back to the process-global db.ts singleton, so
+  // an in-process module-mode disconnect or failed reconnect clears it mid-life
+  // and breaks in-flight cycle/extract/facts writes. Policy lives in the pure,
+  // unit-tested daemon-connection-mode helper.
+  const { isInstanceModeDaemon, needsSingletonSeed } = await import('./core/daemon-connection-mode.ts');
+  const { rest: parsedArgs } = parseGlobalFlags(process.argv.slice(2));
+  const isInstanceDaemon = isInstanceModeDaemon(parsedArgs, engine.kind);
+  const seedSingleton = needsSingletonSeed(parsedArgs, engine.kind);
+
+  await connectWithRetry(
+    engine,
+    isInstanceDaemon ? { ...engineConfig, poolSize: dbmod.resolvePoolSize() } : engineConfig,
+    { noRetry },
+  );
+
+  if (seedSingleton) {
+    try {
+      await dbmod.connect(engineConfig);
+    } catch (e) {
+      console.warn(
+        `[gbrain] worker DB singleton seed failed; integrity/repair-jsonb jobs may error: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
 
   // v0.30.1 (Codex X1 / C2): probeOnly skips both hasPendingMigrations() probe
   // AND initSchema(). Used by `get_health` MCP op + `gbrain upgrade --status`
