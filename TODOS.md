@@ -16,6 +16,271 @@
   `initHostBrain` the same `poolSize` treatment as `initMountBrain`, and verify
   no consumer relies on the registry seeding the global singleton.
 
+## v0.41.29.0 orphan source-scoping follow-ups (v0.42+)
+
+Filed from the v0.41.29.0 wave (bold-name-no-time pattern + orphan_ratio
+source scoping). The Codex outside-voice review (F8) flagged two surfaces
+the wave deliberately scoped out.
+
+- [ ] **v0.42+: thin-client `gbrain doctor --source` orphan_ratio scoping.** v0.41.29.0 scopes `orphan_ratio` to `--source` on the LOCAL doctor path (`buildChecks` in `src/commands/doctor.ts`) and closes the `find_orphans` MCP read leak via `sourceScopeOpts(ctx)`. The thin-client / remote doctor path (`src/core/doctor-remote.ts` `runRemoteDoctor`) is a separate code path that does not thread `--source`, so `gbrain doctor --source x` against a remote `gbrain serve --http` brain still reports brain-wide orphan_ratio. Thread the explicit `--source` into the remote doctor request + have the server-side check honor it. Priority: P3 (most users run doctor locally).
+
+- [ ] **v0.42+: widen `check-test-real-names.sh` BANNED_NAMES to catch real-name reintroduction in tests + src.** v0.41.29.0 scrubbed pre-existing real names (`Garry Tan`, `Alex Graveley`) from `bold-paren-time`'s `test_positive` (and the new `bold-name-no-time` samples), but no automated guard caught them: `check-test-real-names.sh` only scans `test/**` and its BANNED_NAMES list doesn't include `garry tan`; `check-fixture-privacy.sh` only scans `test/fixtures/conversation-formats/`. Add `garry tan` / `garrytan` (and consider extending the scan to `src/core/conversation-parser/builtins.ts` test samples) so future reintroductions fail CI. Priority: P3 (hardening).
+
+## v0.41.28.0 #1570 instrument-then-fix follow-ups (v0.41.28+ / v0.42+)
+
+Filed from the v0.41.28.0 plan-eng-review after the codex outside-voice
+review caught that the original architectural-refactor plan was designed
+for a root cause we hadn't identified. v0.41.28.0 ships the tactical
+symptom fix (retry reconnect) + facts queue drain + diagnostic
+instrumentation. These follow-ups depend on the production data the
+instrumentation collects.
+
+- [ ] **v0.41.28+: Investigate disconnect-call audit data from production; fix the offending ownership boundary.** v0.41.28.0 ships `src/core/audit/db-disconnect-audit.ts` which records every `db.disconnect()` and `PostgresEngine.disconnect()` call with engine kind, connection style, caller stack, command, and pid. Doctor's `batch_retry_health` check surfaces the 24h count + most-recent caller. After the next user-reported `gbrain dream` cycle with reconnect events, read `~/.gbrain/audit/db-disconnect-YYYY-Www.jsonl` (or the doctor JSON output) and identify the specific code path firing the mid-process disconnect. The fix is then a targeted patch to that ownership boundary (per codex outside-voice finding 4 — "audit/log current callers in dream/facts paths, then change only the offending ownership boundary"). Priority: P1 once data exists; tracked by user feedback on #1570 thread.
+
+- [ ] **v0.42+: Re-evaluate module-singleton removal IF the targeted v0.41.26 fix doesn't close the bug class.** The original v0.41.25 plan proposed removing nullability of `let sql: ReturnType<typeof postgres> | null = null` in `src/core/db.ts:7` and renaming `disconnect → shutdown`. Codex outside-voice review found 15 substantive problems (logical contradiction, wrong cleanup primitive, ~120-site scale estimate fantasy, BrainEngine contract asymmetry, etc.). If the targeted v0.41.26 fix closes #1570 cleanly, this refactor is genuinely unnecessary and can be closed. If new disconnect-class bugs surface in v0.41.28+, this is the design-conversation TODO that re-opens. Architecture conversation point: node-postgres explicitly deprecated the singleton pattern gbrain has — pull this in only when there's evidence we keep paying for it. Priority: P3 (speculative). Plan + findings preserved at `~/.claude/plans/system-instruction-you-are-working-cuddly-panda.md`.
+
+## v0.41.26.1 lock-renewal cathedral follow-ups (v0.42+)
+
+- **TODO-LR-1 (P2): PR #1567 surrogate-pair fix for synthesize.ts.**
+  PR #1567 bundled a `safeSliceEnd` UTF-16 surrogate-pair handler
+  alongside the lock-renewal try/catch. The lock-renewal change shipped
+  in v0.41.26.1; the surrogate fix was deferred because it's a
+  different bug class with its own test surface.
+  - **What:** lift `safeSliceEnd` into a shared
+    `src/core/string-safe-slice.ts`, apply to `judgeSignificance` AND
+    `findBoundary` in `src/core/cycle/synthesize.ts`, add round-trip
+    tests with surrogate-bearing transcripts. Pre-existing TODO at
+    TODOS.md (search `Multibyte sanitizer test`) covers part of this
+    — extend that entry.
+  - **Why:** transcripts containing emoji + 4-byte CJK chars get
+    cut mid-pair under the current `.slice(0, N)`, breaking JSON
+    parse downstream and dropping rows.
+  - **Source:** community PR #1567, contributor `@garrytan-agents`.
+
+- **TODO-LR-2 (P2): doctor check `lock_renewal_health`.**
+  v0.41.26.1 ships the audit JSONL primitive without a doctor read
+  surface. For now, `tail -F ~/.gbrain/audit/lock-renewal-*.jsonl` is
+  the operator UX.
+  - **What:** add `checkLockRenewalHealth` in `src/commands/doctor.ts`
+    mirroring `checkBatchRetryHealth` shape. Reads
+    `readRecentLockRenewalEvents(24)`. Warns at >=5 `gave_up` events
+    or >=20 `failure` events in the last 24h. Wired into both
+    `runDoctor` (local) and `doctorReportRemote` (thin-client).
+  - **Why:** operators on production Supabase want a single `gbrain
+    doctor` line to know whether their pool is flapping.
+  - **Pros:** structurally matches the v0.41.18 batch-retry health
+    check. ~50 LOC.
+
+- **TODO-LR-3 (P3): wire `pruneOldLockRenewalAuditFiles(30)` into
+  `gbrain dream --phase purge`.**
+  - **What:** one-line addition at the existing purge handler where
+    `pruneOldBatchRetryAuditFiles` is called today.
+  - **Why:** consistency with the batch-retry audit (which prunes).
+    Without pruning, lock-renewal audit files accumulate one per
+    ISO-week — negligible at first but worth doing the right way.
+
+- **TODO-LR-4 (P2, codex C13): stall-detector re-entrancy guard at
+  worker.ts:269.**
+  The stall-detector `setInterval(async ...)` block has try/catch on
+  every await so it doesn't crash. But it lacks a re-entrancy guard,
+  so during a PgBouncer outage, 3 concurrent stall-detector loops can
+  pile 9 pending connection acquisitions per tick on an
+  already-saturated pool — amplifying the very stall they're trying
+  to detect.
+  - **What:** apply the same `tickInFlight` boolean guard pattern
+    the lock-renewal fix uses. Convert `setInterval(async () => {...})`
+    → `setInterval(() => { if (tickInFlight) return; tickInFlight =
+    true; void (async () => {...})().finally(() => { tickInFlight =
+    false; }); })`.
+  - **Why:** same bug class as the v0.41.22.1 lock-renewal crash, but
+    a different symptom. Doesn't crash, does amplify load.
+  - **Source:** codex outside-voice review of v0.41.26.1 plan.
+
+- **TODO-LR-5 (P3): bare-quoted hostname + username redactor patterns.**
+  The v0.41.26.1 `redactConnectionInfo` catches bare `host=`,
+  `user=`, `password=`, `pg_url`, `ipv4` patterns but NOT
+  bare-quoted hostnames (`connection to server at "db.example.com"`)
+  or bare-quoted usernames (`for user "postgres.abcdef123456"`). The
+  IP in those PG error shapes is the highest-value leak (publicly
+  resolvable), and that one IS caught.
+  - **What:** extend the pattern set with optional quoted-string
+    matchers, OR add a context-aware matcher that looks for `at
+    "...".? (?:port|.)` shapes.
+  - **Cons:** quoted-string false positives are common (DB names,
+    role names); needs careful pattern design.
+
+## v0.41.20.x dream-source-ingest-titles follow-ups (v0.42+)
+
+- **TODO-V13-A (P2): `gbrain dream --max-pages <n>` plumbing.**
+  PR #1559 included a `--max-pages` flag for cost-bounded cycles on
+  large brains. v0.41.20 dropped it because `CycleOpts` has no `maxPages`
+  field and no cycle phase consults page-count limits — shipping the flag
+  would have been a lying flag.
+  - **What:** extend `CycleOpts` with `maxPages: number | undefined` and
+    thread it through extract phases (extract.ts, extract-facts.ts,
+    recompute-emotional-weight.ts) so per-source cost-bounded cycles
+    become real.
+  - **Why:** straylight-brain-class corpora (100K+ pages) benefit from
+    capping each cycle's work. Today operators have to wait full
+    extract sweeps regardless of cost.
+  - **Pros:** closes the lying-flag class; real cost brake.
+  - **Cons:** real refactor — extract phases iterate all pages today,
+    not page-count-bounded.
+  - **Context:** PR #1559 commit 67f98ca had the flag; the v0.41.20
+    plan dropped it under "Out of scope" with this TODO as the
+    forwarding pointer.
+  - **Depends on:** CycleOpts type extension + extract page-iteration
+    refactor + decision on per-phase vs per-cycle cap semantics.
+
+- **TODO-V13-B (P3): `--source` / `--source-id` flag-name unification.**
+  Current drift: `dream`, `recall`, `sync` accept `--source`;
+  `import`, `extract`, `graph-query`, `sources` accept `--source-id`.
+  v0.41.20 added `--source-id` as an alias for dream's `--source` so
+  both work, but the codebase still ships two surface names.
+  - **What:** pick one canonical flag name across all CLI commands;
+    deprecate the other with a stderr warning; update doctor.ts
+    hint to match.
+  - **Why:** ergonomic consistency. Users who learned `--source-id`
+    via import shouldn't trip on `--source` in dream.
+  - **Pros:** ends a real user-facing confusion.
+  - **Cons:** low-priority polish; both names work today via alias.
+  - **Context:** doctor.ts historically pinned `--source`; v0.37.7.0
+    #1167 standardized `--source-id` across new commands. Recommend
+    picking `--source-id` for v0.37.7.0+ consistency and deprecating
+    `--source` over one minor.
+  - **Depends on:** nothing technical.
+
+- **TODO-V13-C (P2): `gbrain pages audit-junk-titles` legacy cleanup.**
+  v0.41.20 widened the `error_page_title` matcher to catch Cloudflare /
+  WAF challenge titles ("Forbidden", "Access Denied", "Service
+  Unavailable", "Robot Check", "Just a moment...") at ingest. But the
+  200+ scraper pages already in production DBs (202+ from
+  straylight-brain) are NOT cleaned up by the matcher widening.
+  Dropped from v0.41.20 per codex outside-voice tension (T1) for
+  ship-and-validate-matchers-first discipline.
+  - **What:** new operator command for soft-deleting pre-existing
+    scraper-junk pages whose titles match the expanded
+    `BUILT_IN_JUNK_PATTERNS`. Full spec preserved:
+    - Signature: `gbrain pages audit-junk-titles [--source <id>]
+      [--dry-run|--apply] [--confirm-destructive] [--json]`
+    - Default `--dry-run`. Prints `{pattern_name: count, sample_slugs}`.
+    - `--apply` requires `--confirm-destructive` when match count
+      exceeds `DESTRUCTIVE_THRESHOLD` (reuse v0.26.5 constant).
+    - `--source <id>` scopes; without it, audits all non-archived
+      sources (filter via `listAllSources().filter(s => !s.archived)`).
+    - Soft-delete via existing `engine.softDeletePage(slug, sourceId)`.
+    - Audit JSONL via `logContentSanityEvent` with event kind
+      `junk_title_soft_deleted`.
+    - Idempotent.
+    - **Hybrid SQL+JS scanner**: pure
+      `buildJunkTitleSqlClause(patterns)` +
+      `scanForJunkTitles(rows, patterns)`. SQL pre-filter avoids
+      streaming all rows over the wire (perf rationale: even seq-scan
+      ILIKE beats JS regex per-row via the postgres driver).
+    - **`cleanup_safe: boolean` flag** per JunkPattern (codex C-13):
+      only patterns flagged `cleanup_safe: true` are eligible for
+      destructive cleanup. Stops future matcher widening from
+      automatically expanding destructive scope. Initial allowlist:
+      `cloudflare_attention_required`, `cloudflare_just_a_moment`,
+      `cloudflare_ray_id`, `access_denied`, `captcha_required`,
+      `error_page_title` (only the literal-numeric parts; the new
+      word-titles get `cleanup_safe: false` until the matcher proves
+      itself further), `cloudflare_challenge_title`.
+    - New doctor check `scraper_junk_pages_legacy` (separate from
+      `content_sanity_audit_recent` per codex C-5 — audit-log reader
+      vs live DB scan are different concerns).
+    - Tests: `test/pages-audit-junk-titles.test.ts` (hermetic PGLite),
+      `test/doctor.test.ts` extension.
+  - **Why:** ingest gate alone leaves 200+ existing junk pages
+    inflating page counts; this command closes the data-debt gap.
+  - **Pros:** finishes the cleanup story.
+  - **Cons:** destructive surface (soft-delete + audit JSONL).
+  - **Depends on:** ~1 week of production observation against
+    v0.41.20's new ingest matchers. If real-world reports surface
+    false-positive blocks, refine the matcher AND the `cleanup_safe`
+    allowlist before shipping the destructive command.
+
+## v0.41.22.1 brainstorm judge fix-wave follow-ups (v0.42+)
+
+Filed from the v0.41.22.1 plan-eng-review per cross-model-tension D13c.
+Step 0 of that plan explicitly deferred a "full pricing-system DRY"
+cleanup (Option C) to keep the brainstorm fix blast radius small.
+These three items are what was deferred. None are user-reported bugs;
+all are latent-debt cleanup.
+
+- [ ] **Config-write normalization.** Whenever a user writes `gbrain config set models.tier.deep anthropic/claude-opus-4-7` we silently store the slash form. v0.41.22.1 centralized the read-side via `splitProviderModelId`, but config writes still preserve whatever shape the user typed. Canonical form should be colon (`anthropic:claude-opus-4-7`). Fix: rewrite at config-write time in `src/core/config.ts`. Breaks existing config files that explicitly hold the slash form — defer to a v0.42+ config-migration wave that also handles the rewrite + once-per-process deprecation warn. Files: `src/core/config.ts`, `src/core/model-config.ts:saveConfig` path. Priority: P3 (latent, not user-visible).
+
+- [ ] **Non-Anthropic pricing tables.** `src/core/anthropic-pricing.ts` is the only pricing surface gbrain ships. Brainstorm + LSD users routing through OpenAI / Gemini / OpenRouter get `BUDGET_TRACKER_NO_PRICING` warn-once + bypass-gate (without `--max-cost`) OR `no_pricing` hard-fail (with `--max-cost`). The right shape: rename to `provider-pricing.ts`, add OpenAI / Gemini / OpenRouter tables, route `lookupPricing` through provider-routed table selection. OpenRouter is a special case (period-vs-dash key mismatch: their `claude-sonnet-4.6` won't match our `claude-sonnet-4-6` either way). Files: `src/core/anthropic-pricing.ts` (rename + extend), `src/core/budget/budget-tracker.ts`, `src/core/eval-contradictions/cost-tracker.ts`. Priority: P2 (real user pain when running brainstorm against non-Anthropic).
+
+- [ ] **Eval-contradictions duplicate ANTHROPIC_PRICING consolidation.** `src/core/eval-contradictions/cost-tracker.ts:28-38` ships its OWN copy of the Anthropic pricing table with different keys (both bare and `anthropic:`-prefixed forms) and a silent-Haiku fallback on unknown. v0.41.22.1 routed both tables' lookups through `splitProviderModelId` but left the duplication. Right fix: delete the local table, import from `src/core/anthropic-pricing.ts`. Either (a) preserve the silent-Haiku-fallback semantic with an explicit `?? canonicalPricing['claude-haiku-4-5']` at the call site, or (b) tighten to warn-once on unknown (which changes the eval-contradictions soft-ceiling `--budget-usd` contract — coordinate with that subsystem). Files: `src/core/eval-contradictions/cost-tracker.ts`, `src/core/anthropic-pricing.ts`, `test/eval-contradictions/cost-tracker-slash.test.ts` (the legacy-Haiku-fallback pin would need updating). Priority: P3 (DRY cleanup, no user-visible impact).
+
+## v0.41.21.0 ops-fix-wave follow-ups (v0.41.22+)
+
+- **TODO-OPS-1 (P2)**: `gbrain sync print-cron` subcommand. Print the canonical
+  cron line based on the active source set: `gbrain sync --all --parallel N
+  --workers N --skip-failed` where N defaults to `min(sourceCount, 4)`. Reads
+  `sources` table for active (non-archived, `local_path IS NOT NULL`) entries.
+  Ergonomic upgrade over the v0.41.19.0 `sync_consolidation` doctor message —
+  operator pipes directly into `crontab -e` instead of copy-paste-massage.
+  ~80 LOC. Mirrors `gbrain sync --break-lock` argv shape.
+
+- **TODO-OPS-2 (P2)**: Lock-loss detection — extend `DbLockHandle.refresh()`
+  to throw `LockLostError` on 0 rows affected. Codex caught during the
+  v0.41.19.0 plan review: `refresh()` runs `UPDATE ... WHERE holder_pid = pid`
+  with no rows-affected check (`db-lock.ts:108-114`, `:151-156`). If the
+  TTL expired and another worker took over, the original keeps writing
+  silently. v0.41.19.0 ships TTL=5min + active in-phase refresh via
+  `buildYieldDuringPhase` which makes the race window much narrower, but
+  an `await chat()` call that exceeds the 5min wallclock window can still
+  hit it. Fix: `RETURNING id` on the UPDATE + check `rows.length === 0` →
+  throw tagged `LockLostError`. Phases catch + abort cleanly (write partial
+  progress, return `status: 'fail'` with reason `'lock_lost'`). Behavioral
+  contract change with phase-abort fallout; needs its own design pass.
+
+## v0.41.20.0 status + doctor-categories wave follow-ups (v0.42+)
+
+- **TODO-V19-A (P3)**: Persistent `cycle_runs` table. v0.41.19.0 infers
+  "last full cycle" by querying `minion_jobs WHERE name = 'autopilot-cycle'`
+  for the most recent completed row. This works but conflates "cycle ran
+  via the autopilot scheduler" with "cycle ran." A dedicated `cycle_runs`
+  table written from `runCycle` directly would let `gbrain status`
+  surface manual `gbrain dream` invocations + per-source partial cycles
+  separately. Defer until the inference's accuracy limits actually bite
+  someone.
+
+- **TODO-V19-B (P2)**: Surface `extract_atoms` + `synthesize_concepts`
+  counts in `CycleReport.totals` top-level. Today the counts live inside
+  each phase's `details` field; the v0.41.19.0 `gbrain status` cycle
+  section can't surface them without per-phase parsing. Bump the
+  `CycleReport.totals` shape additively (the existing field is
+  documented as additive) and add `atoms_inserted` +
+  `concepts_inserted` next to `facts_consolidated`.
+
+- **TODO-V19-C (P3)**: Check-registry refactor for `gbrain doctor`. The
+  v0.41.19.0 `--scope=brain` uses explicit early-skip gates inline at
+  each call site (~40 LOC across resolver + skill_conformance +
+  skill_brain_first + whoknows). If we want to add more scope
+  dimensions later (e.g. `--scope=ops`, `--exclude-skill`), the right
+  next step is a check registry: each check declares
+  `{name, category, run}`, `buildChecks` becomes "run all entries
+  whose category is in scope." ~300 LOC, touches every check site.
+  Considered + rejected for v0.41.19.0 as too large for a single fix
+  wave (D9-B option in the plan).
+
+- **TODO-V19-D (P3)**: Read installed launchd/cron/systemd schedule
+  to compute a real "next autopilot tick" timestamp. v0.41.19.0
+  status surfaces "Autopilot: running (PID N)" instead. Cross-OS
+  scheduler probing is a separate, larger problem; macOS launchd
+  plist parsing alone is ~80 LOC.
+
+- **TODO-V19-E (P2)**: Apply category-aware exit codes to
+  `gbrain doctor`. Today doctor exits 0 on all-ok, 1 on any fail.
+  After categorization, a CI gate could opt into "fail only on
+  brain-category failures" via `--scope=brain` (already shipping) or
+  a `--fail-on=brain` flag. Filing this as a discoverability
+  follow-up — the `--scope=brain` flag already covers most of the
+  use case.
+
 ## v0.41.18.0 onboard wave follow-ups (v0.42.1+)
 
 - **TODO-A (P2)**: Pack-aware `linkable: boolean` per-type field on schema-pack
@@ -61,7 +326,7 @@
   takes_count). Today the MCP run_onboard op runs these server-side via
   runAllOnboardChecks; doctor-remote.ts would surface them on the thin-client
   dashboard for operators who only hit the brain via MCP.
-=======
+
 ## v0.41.17.0 `--workers N` cathedral follow-ups (v0.41.18+)
 
 These were filed during the ship of `garrytan/dar-es-salaam-v1`
@@ -1191,7 +1456,7 @@ contributor traps.
 
 - [ ] **v0.40: magic-byte allowlist for `gbrain capture` binary file detection.** v0.39.3.0 (Phase 3c, CV10) ships a first-8KB NUL-byte scan that catches typical binaries (executables, archives, most image formats). Known gap per CV10-B: a PNG with no NUL byte in its first 8KB slips through. Production-grade detection needs a magic-byte allowlist (PNG/JPEG/GIF/PDF/ZIP signatures). Implement in `src/commands/capture.ts:detectBinaryNullByte` (rename to `detectBinaryInput`) with a small `BINARY_MAGIC_BYTES` table. Reuse the same `assertSourceExists`-style friendly error pattern; reject before UTF-8 decode mangles the bytes. Tests in `test/capture-binary-guard.test.ts` should add cases for the PNG-without-NUL boundary.
 
-- [ ] **v0.40: facts:absorb root-cause investigation.** v0.39.3.0 (Phase 4c, CV13) suppresses the per-capture `[facts:absorb] failed to log gateway_error for inbox/...: No database connection` noise AND prints a first-occurrence stack trace so the v0.40 fix knows where to look. The actual fix is one of: (a) thread the connected engine through the facts pipeline so it doesn't open its own handle; (b) no-op the absorb-log when called from a CLI context where the doctor health check isn't the consumer; (c) make the facts subsystem connection-aware and queue retries. The stack trace from `src/core/facts/absorb-log.ts:writeFactsAbsorbLog`'s first-occurrence info-log is the input.
+- [ ] **v0.40: facts:absorb root-cause investigation.** v0.39.3.0 (Phase 4c, CV13) suppresses the per-capture `[facts:absorb] failed to log gateway_error for inbox/...: No database connection` noise AND prints a first-occurrence stack trace so the v0.40 fix knows where to look. The actual fix is one of: (a) thread the connected engine through the facts pipeline so it doesn't open its own handle; (b) no-op the absorb-log when called from a CLI context where the doctor health check isn't the consumer; (c) make the facts subsystem connection-aware and queue retries. The stack trace from `src/core/facts/absorb-log.ts:writeFactsAbsorbLog`'s first-occurrence info-log is the input. **v0.41.25.0 update:** the related #1570 wave shipped a partial fix at the queue level — CLI op-dispatch now awaits `FactsQueue.drainPending({timeout: 1000})` before `engine.disconnect()`, which closes the visible-stderr-line symptom for `gbrain capture`. The deeper "thread engine through pipeline" architectural question (option a above) stays open for v0.40+; the drain fix is a queue-lifetime patch, not a pipeline-rearchitecture.
 
 - [ ] **v0.40: `--source-kind` override flag for `gbrain capture`.** v0.39.3.0 (Phase 3c, CV3) locked source_kind to `'capture-cli'` for capture invocations (the deferred CV3-B alternative). Real use case for the override: Apple Shortcuts / Zapier-style automations that shell out to `gbrain capture` and want their pages labeled `apple-shortcut` or `zapier` in the audit trail. Implementation: add a small flag with an allowlist (similar to migration v81's closed taxonomy: `capture-cli | apple-shortcut | zapier | <skillpack-kind>`); validate at parse time; CV6 remote-spoofing guard still applies (server stamps `mcp:put_page` regardless when `ctx.remote !== false`).
 
