@@ -2,6 +2,41 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.30.0] - 2026-05-30
+
+**The autopilot cycle no longer burns LLM tokens on the broken calibration
+phases.** The v0.36.1.0 `propose_takes` / `grade_takes` / `calibration_profile`
+phases are now OFF by default in the automatic cycle.
+
+Why: `propose_takes` ships a stub extractor prompt that returns no gradeable
+claims for most pages, and it never caches those negative results. So the
+idempotency check misses the page every cycle and the LLM re-runs on it forever.
+On a multi-thousand-page brain that is an unbounded token avalanche: the phase
+blows past the 600s cycle timeout, gets killed mid-run, makes zero durable
+progress, and the next cycle repeats it. Disabling the trio by default makes the
+avalanche structurally impossible. The daemon now skips all three in
+milliseconds.
+
+The phases stay registered, so explicit `gbrain dream --phase propose_takes` and
+the per-phase unit tests still work. Re-enable them in the automatic cycle (once
+the upstream stub prompt is replaced) with:
+
+    gbrain config set cycle.calibration.enabled true
+
+The gate lives in the cycle dispatch (`src/core/cycle.ts`), so per-phase unit
+tests that call the phase functions directly are unaffected. Pinned by a new
+regression block in `test/core/cycle.serial.test.ts` (skipped by default, runs
+when enabled, explicit single-phase still gated).
+
+### Also in this fork (vs upstream v0.41.29.0)
+
+This fork carries three autopilot fixes not yet upstream:
+- Daemons use instance-mode DB pools (the original autopilot connection
+  avalanche fix).
+- The autopilot fan-out skips sources whose `local_path` isn't on this machine.
+- `gbrain opencode-export` renders opencode chat history into the synthesize
+  corpus.
+
 ## [0.41.29.0] - 2026-05-29
 
 **Your meeting transcripts that look like `**Garry Tan:** ...` now actually

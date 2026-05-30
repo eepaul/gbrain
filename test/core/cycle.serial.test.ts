@@ -557,3 +557,60 @@ describe('runCycle — sourceId resolution (regression #475)', () => {
     expect(syncCalls.at(-1)?.sourceId).toBe('');
   });
 });
+
+// ─── Calibration phase gate (v0.41.20.1) ───────────────────────────
+//
+// The v0.36.1.0 calibration trio (propose_takes / grade_takes /
+// calibration_profile) is OFF by default in the automatic cycle. The
+// extractor prompts are stubs and the phase has a negative-result
+// caching bug: a page that yields zero gradeable claims never writes a
+// take_proposals row, so the idempotency SELECT misses it forever and the
+// LLM re-runs on it every cycle — an unbounded token avalanche that blows
+// past the cycle timeout. These tests pin the gate: skipped by default,
+// runnable via `cycle.calibration.enabled`, and still gated even on an
+// explicit single-phase invocation.
+
+describe('runCycle — calibration phases gated off by default (v0.41.20.1)', () => {
+  const CALIB_PHASES = ['propose_takes', 'grade_takes', 'calibration_profile'] as const;
+
+  beforeEach(async () => {
+    await truncateCycleLocks(sharedEngine);
+    await sharedEngine.unsetConfig('cycle.calibration.enabled');
+    // Empty page set so the enabled path makes zero gateway calls
+    // (propose_takes over 0 pages never invokes the extractor).
+    await (sharedEngine as any).db.query('DELETE FROM pages');
+  });
+
+  afterEach(async () => {
+    await sharedEngine.unsetConfig('cycle.calibration.enabled');
+  });
+
+  test('default config: trio is skipped with reason calibration_disabled', async () => {
+    const report = await runCycle(sharedEngine, { brainDir: '/tmp/brain' });
+    for (const name of CALIB_PHASES) {
+      const phase = report.phases.find(p => p.phase === name);
+      expect(phase).toBeDefined();
+      expect(phase?.status).toBe('skipped');
+      expect(phase?.details.reason).toBe('calibration_disabled');
+    }
+  });
+
+  test('cycle.calibration.enabled=true: trio runs (no calibration_disabled marker)', async () => {
+    await sharedEngine.setConfig('cycle.calibration.enabled', 'true');
+    const report = await runCycle(sharedEngine, { brainDir: '/tmp/brain' });
+    for (const name of CALIB_PHASES) {
+      const phase = report.phases.find(p => p.phase === name);
+      expect(phase).toBeDefined();
+      // When enabled the real phase runs against an empty brain → it must
+      // NOT carry the gate's disabled marker.
+      expect(phase?.details.reason).not.toBe('calibration_disabled');
+    }
+  });
+
+  test('explicit --phase propose_takes is still gated off by default', async () => {
+    const report = await runCycle(sharedEngine, { brainDir: '/tmp/brain', phases: ['propose_takes'] });
+    const phase = report.phases.find(p => p.phase === 'propose_takes');
+    expect(phase?.status).toBe('skipped');
+    expect(phase?.details.reason).toBe('calibration_disabled');
+  });
+});

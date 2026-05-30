@@ -1837,13 +1837,45 @@ export async function runCycle(
           sourceId: calibrationSourceId,
         } as never;
 
+        // v0.41.30.0 — the v0.36.1.0 calibration trio is OFF by default in the
+        // automatic cycle. Two reasons:
+        //   1. The extractor prompts are stubs (see the prompt-tuning note in
+        //      cycle/propose-takes.ts) — empirically they return [] for most
+        //      pages.
+        //   2. Negative results are never cached. When the extractor returns
+        //      no gradeable claims for a page, the loop writes no take_proposals
+        //      row, so the idempotency SELECT (propose-takes.ts) misses that
+        //      page forever and the LLM re-runs on it every single cycle. On a
+        //      multi-thousand-page brain that is an unbounded token avalanche:
+        //      the phase blows past the cycle timeout, gets SIGKILLed mid-run,
+        //      makes zero durable progress, and the next cycle repeats it.
+        // The phases stay in ALL_PHASES so explicit `gbrain dream --phase
+        // propose_takes` and the per-phase unit tests still exercise them. To
+        // re-enable them in the automatic cycle once the stub is replaced:
+        //   gbrain config set cycle.calibration.enabled true
+        const calibEnabledRaw = await engine.getConfig('cycle.calibration.enabled');
+        const calibrationEnabled =
+          calibEnabledRaw != null &&
+          !['false', '0', 'no', 'off', ''].includes(calibEnabledRaw.trim().toLowerCase());
+        const calibrationDisabledResult = (phase: CyclePhase): PhaseResult => ({
+          phase,
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'calibration disabled (set cycle.calibration.enabled=true to run)',
+          details: { reason: 'calibration_disabled' },
+        });
+
         if (phases.includes('propose_takes')) {
           checkAborted(opts.signal);
           progress.start('cycle.propose_takes');
-          const { runPhaseProposeTakes } = await import('./cycle/propose-takes.ts');
-          const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, { repoPath: opts.brainDir }) as Promise<PhaseResult>);
-          result.duration_ms = duration_ms;
-          phaseResults.push(result);
+          if (calibrationEnabled) {
+            const { runPhaseProposeTakes } = await import('./cycle/propose-takes.ts');
+            const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, { repoPath: opts.brainDir }) as Promise<PhaseResult>);
+            result.duration_ms = duration_ms;
+            phaseResults.push(result);
+          } else {
+            phaseResults.push(calibrationDisabledResult('propose_takes'));
+          }
           progress.finish();
           await safeYield(opts.yieldBetweenPhases);
         }
@@ -1851,10 +1883,14 @@ export async function runCycle(
         if (phases.includes('grade_takes')) {
           checkAborted(opts.signal);
           progress.start('cycle.grade_takes');
-          const { runPhaseGradeTakes } = await import('./cycle/grade-takes.ts');
-          const { result, duration_ms } = await timePhase(() => runPhaseGradeTakes(calibrationCtx, {}) as Promise<PhaseResult>);
-          result.duration_ms = duration_ms;
-          phaseResults.push(result);
+          if (calibrationEnabled) {
+            const { runPhaseGradeTakes } = await import('./cycle/grade-takes.ts');
+            const { result, duration_ms } = await timePhase(() => runPhaseGradeTakes(calibrationCtx, {}) as Promise<PhaseResult>);
+            result.duration_ms = duration_ms;
+            phaseResults.push(result);
+          } else {
+            phaseResults.push(calibrationDisabledResult('grade_takes'));
+          }
           progress.finish();
           await safeYield(opts.yieldBetweenPhases);
         }
@@ -1862,10 +1898,14 @@ export async function runCycle(
         if (phases.includes('calibration_profile')) {
           checkAborted(opts.signal);
           progress.start('cycle.calibration_profile');
-          const { runPhaseCalibrationProfile } = await import('./cycle/calibration-profile.ts');
-          const { result, duration_ms } = await timePhase(() => runPhaseCalibrationProfile(calibrationCtx, {}) as Promise<PhaseResult>);
-          result.duration_ms = duration_ms;
-          phaseResults.push(result);
+          if (calibrationEnabled) {
+            const { runPhaseCalibrationProfile } = await import('./cycle/calibration-profile.ts');
+            const { result, duration_ms } = await timePhase(() => runPhaseCalibrationProfile(calibrationCtx, {}) as Promise<PhaseResult>);
+            result.duration_ms = duration_ms;
+            phaseResults.push(result);
+          } else {
+            phaseResults.push(calibrationDisabledResult('calibration_profile'));
+          }
           progress.finish();
           await safeYield(opts.yieldBetweenPhases);
         }
