@@ -2203,6 +2203,18 @@ export interface ChatOpts {
    * ignored on providers without `supports_prompt_cache`.
    */
   cacheSystem?: boolean;
+  /**
+   * v0.41.31.0 — caller-controlled retry cap on the Vercel AI SDK's
+   * `generateText`. Default behavior (undefined): SDK applies its built-in
+   * retry policy (2 retries with exponential backoff). Pass `0` for
+   * call-sites that want the SDK to fail fast — most commonly when the
+   * provider is behind a proxy that already does its own retries, so
+   * stacking SDK retries on top is pure amplification (the v0.41.30
+   * propose_takes throw-storm root cause: SDK 2 × proxy 3 = 9× per
+   * failure). Mirrors the existing `maxRetries` passthrough on the
+   * `embed()` / `embedMany()` path (gateway.ts:1444, v0.33.4).
+   */
+  maxRetries?: number;
 }
 
 async function resolveChatProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
@@ -2392,6 +2404,10 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       maxOutputTokens: opts.maxTokens ?? 4096,
       abortSignal: opts.abortSignal,
       providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
+      // v0.41.31.0: per-call retry override. Defaults to SDK's built-in
+      // policy when undefined. propose_takes passes 0 to defeat the
+      // SDK-on-top-of-proxy retry amplification (see ChatOpts JSDoc).
+      ...(opts.maxRetries !== undefined && { maxRetries: opts.maxRetries }),
     });
 
     // Normalize blocks. Vercel SDK gives us `result.content` (an array of typed

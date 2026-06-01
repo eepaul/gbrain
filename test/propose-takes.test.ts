@@ -385,3 +385,208 @@ New prose appended here.`;
     expect((runIdA as string).startsWith('propose-')).toBe(true);
   });
 });
+
+// ─── Negative-result sentinel (v0.41.30.0 avalanche fix) ────────────
+//
+// THE regression for the calibration token-avalanche. Pre-fix, a page that
+// extracted zero gradeable claims wrote no take_proposals row, so the
+// idempotency SELECT missed it forever and re-spent the LLM on it every
+// cycle. The fix writes one status='empty' sentinel row so the next cycle's
+// SELECT hits. These tests pin: (1) a sentinel is written on [], (2) a second
+// run on the same []-page is a cache hit with NO extractor call (convergence),
+// (3) the sentinel carries status='empty', (4) non-empty extraction writes no
+// sentinel.
+
+/**
+ * Stateful mock: INSERTs (real proposals AND sentinels) populate an
+ * insertedKeys set keyed on the idempotency tuple, so a subsequent run's
+ * `SELECT id FROM take_proposals` hits — exactly what real Postgres/PGLite
+ * does via the take_proposals_idempotency_idx unique index. The plain
+ * buildMockEngine above does NOT simulate this (its `existing` set is static),
+ * so the avalanche-convergence assertion needs this richer double.
+ */
+function buildStatefulMockEngine(opts: { pages: Page[] }): {
+  engine: BrainEngine;
+  captured: CapturedSql[];
+  insertedKeys: Set<string>;
+} {
+  const captured: CapturedSql[] = [];
+  const insertedKeys = new Set<string>();
+  const engine = {
+    kind: 'pglite',
+    async listPages() {
+      return opts.pages;
+    },
+    async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
+      captured.push({ sql, params: params ?? [] });
+      const [sourceId, slug, ch, pv] = params ?? [];
+      const key = `${sourceId}|${slug}|${ch}|${pv}`;
+      if (sql.includes('SELECT id FROM take_proposals')) {
+        return insertedKeys.has(key) ? [{ id: 1 } as unknown as T] : [];
+      }
+      if (sql.includes('INSERT INTO take_proposals')) {
+        // ON CONFLICT DO NOTHING — first write of a key wins; mirror that.
+        insertedKeys.add(key);
+        return [];
+      }
+      return [];
+    },
+  } as unknown as BrainEngine;
+  return { engine, captured, insertedKeys };
+}
+
+describe('runPhaseProposeTakes — negative-result sentinel', () => {
+  test('empty extraction writes one sentinel row (status=empty)', async () => {
+    const pages = [buildPage({ slug: 'wiki/no-claims', body: 'A page with zero gradeable claims, just facts.' })];
+    const { engine, captured } = buildStatefulMockEngine({ pages });
+    const extractor: ProposeTakesExtractor = async () => []; // no gradeable claims
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    expect(result.status).toBe('ok');
+    const details = result.details as Record<string, unknown>;
+    expect(details.pages_scanned).toBe(1);
+    expect(details.cache_misses).toBe(1);
+    expect(details.proposals_inserted).toBe(0);
+    expect(details.sentinels_written).toBe(1);
+
+    const inserts = captured.filter(c => c.sql.includes('INSERT INTO take_proposals'));
+    expect(inserts).toHaveLength(1);
+    // The sentinel INSERT carries the literal status='empty' so the pending
+    // index (WHERE status='pending') excludes it from `gbrain takes propose`.
+    expect(inserts[0]!.sql).toContain("'empty'");
+  });
+
+  test('AVALANCHE FIX: second run on the same empty page is a cache hit, NO extractor call', async () => {
+    const pages = [buildPage({ slug: 'wiki/no-claims', body: 'Zero gradeable claims here.' })];
+    const { engine } = buildStatefulMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      extractorCalls += 1;
+      return [];
+    };
+
+    // Cycle 1: cache miss → extractor called once → sentinel written.
+    const run1 = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(extractorCalls).toBe(1);
+    expect((run1.details as Record<string, unknown>).sentinels_written).toBe(1);
+    expect((run1.details as Record<string, unknown>).cache_hits).toBe(0);
+
+    // Cycle 2: the sentinel makes the idempotency SELECT hit → NO extractor
+    // call, NO new sentinel. This is the avalanche dying: a zero-claim page is
+    // LLM'd at most once per (content_hash, prompt_version), not every cycle.
+    const run2 = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(extractorCalls).toBe(1); // still 1 — NOT re-called
+    const d2 = run2.details as Record<string, unknown>;
+    expect(d2.cache_hits).toBe(1);
+    expect(d2.cache_misses).toBe(0);
+    expect(d2.sentinels_written).toBe(0);
+  });
+
+  test('non-empty extraction writes proposals, NOT a sentinel', async () => {
+    const pages = [buildPage({ slug: 'wiki/has-claim', body: 'I bet this market compresses in 18 months.' })];
+    const { engine, captured } = buildStatefulMockEngine({ pages });
+    const extractor: ProposeTakesExtractor = async () => [
+      { claim_text: 'market compresses in 18mo', kind: 'bet', holder: 'brain', weight: 0.7 },
+    ];
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    const details = result.details as Record<string, unknown>;
+    expect(details.proposals_inserted).toBe(1);
+    expect(details.sentinels_written).toBe(0);
+    const inserts = captured.filter(c => c.sql.includes('INSERT INTO take_proposals'));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]!.sql).not.toContain("'empty'");
+  });
+
+  test('mixed batch: empty pages get sentinels, claim pages get proposals, second run skips both', async () => {
+    const pages = [
+      buildPage({ slug: 'wiki/empty-a', body: 'just facts, no claims' }),
+      buildPage({ slug: 'wiki/has-claim', body: 'I predict X wins.' }),
+      buildPage({ slug: 'wiki/empty-b', body: 'more pure facts' }),
+    ];
+    const { engine } = buildStatefulMockEngine({ pages });
+    let extractorCalls = 0;
+    const extractor: ProposeTakesExtractor = async ({ pagePath }) => {
+      extractorCalls += 1;
+      return pagePath === 'wiki/has-claim'
+        ? [{ claim_text: 'X wins', kind: 'bet', holder: 'brain', weight: 0.6 }]
+        : [];
+    };
+
+    const run1 = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(extractorCalls).toBe(3);
+    const d1 = run1.details as Record<string, unknown>;
+    expect(d1.sentinels_written).toBe(2);
+    expect(d1.proposals_inserted).toBe(1);
+
+    // Second run: all three pages cached (2 sentinels + 1 proposal key) → zero
+    // extractor calls. The whole batch converges.
+    const run2 = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(extractorCalls).toBe(3); // unchanged
+    const d2 = run2.details as Record<string, unknown>;
+    expect(d2.cache_hits).toBe(3);
+    expect(d2.sentinels_written).toBe(0);
+    expect(d2.proposals_inserted).toBe(0);
+  });
+});
+
+// ─── Circuit breaker — throw-storm vector (v0.41.30.0) ───────────────
+//
+// The OTHER avalanche vector, surfaced by the real-LLM probe: when the
+// provider/proxy is down EVERY extractor call throws (after 3 internal
+// retries each). Pre-breaker, the phase ground all 100 pages through the
+// down provider every cycle. A THROW must NOT be cached (it may be
+// transient — a 502 from the proxy upstream), so the sentinel path can't
+// cover it. Instead a consecutive-failure breaker aborts the phase early
+// and lets the pages retry next cycle once the provider recovers.
+
+describe('runPhaseProposeTakes — circuit breaker (throw-storm)', () => {
+  test('3 consecutive throws abort the phase early, and throws are NOT cached', async () => {
+    const pages = Array.from({ length: 10 }, (_, i) => buildPage({ slug: `wiki/p${i}`, body: `prose ${i}` }));
+    const { engine, captured } = buildMockEngine({ pages });
+    let calls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      calls += 1;
+      throw new Error('[chat] Failed after 3 attempts. Last error: Upstream error 502');
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    expect(calls).toBe(3); // aborted after 3 in a row, NOT all 10
+    const d = result.details as Record<string, unknown>;
+    expect(d.circuit_broken).toBe(true);
+    expect(d.extractor_failures).toBe(3);
+    expect(d.sentinels_written).toBe(0); // throws are not cached
+    expect(result.status).toBe('warn');
+    // No INSERT of any kind — a down provider must not pollute the queue.
+    expect(captured.filter(c => c.sql.includes('INSERT INTO take_proposals'))).toHaveLength(0);
+  });
+
+  test('a lone throw between successes does NOT trip the breaker (counter resets)', async () => {
+    const pages = Array.from({ length: 5 }, (_, i) => buildPage({ slug: `wiki/p${i}`, body: `prose ${i}` }));
+    const { engine } = buildMockEngine({ pages });
+    let calls = 0;
+    const extractor: ProposeTakesExtractor = async () => {
+      calls += 1;
+      if (calls === 2 || calls === 4) throw new Error('transient blip');
+      return []; // the other three succeed with zero claims → sentinels
+    };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+
+    const d = result.details as Record<string, unknown>;
+    expect(calls).toBe(5); // never 3 throws in a row → all pages processed
+    expect(d.circuit_broken).toBe(false);
+    expect(d.extractor_failures).toBe(2);
+    expect(d.sentinels_written).toBe(3); // the successful []-returns
+    expect(result.status).toBe('ok');
+  });
+
+  test('maxConsecutiveExtractorFailures is configurable', async () => {
+    const pages = Array.from({ length: 5 }, (_, i) => buildPage({ slug: `wiki/p${i}`, body: `x${i}` }));
+    const { engine } = buildMockEngine({ pages });
+    let calls = 0;
+    const extractor: ProposeTakesExtractor = async () => { calls += 1; throw new Error('down'); };
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, maxConsecutiveExtractorFailures: 2 });
+    expect(calls).toBe(2);
+    expect((result.details as Record<string, unknown>).circuit_broken).toBe(true);
+  });
+});

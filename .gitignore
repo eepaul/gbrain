@@ -41,3 +41,7 @@ test/fixtures/pglite-snapshot.version
 
 # Private brain reports — never check these in (per CLAUDE.md privacy rule)
 reports/network-intelligence/
+
+# API keys must never enter the worktree (backstop, also rejected by gitleaks)
+opencode-go-api-key
+*-api-key

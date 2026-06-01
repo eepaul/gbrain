@@ -1742,6 +1742,10 @@ export function buildGatewayConfig(c: GBrainConfig): AIGatewayConfig {
   // setting it via `~/.gbrain/config.json` propagates into the gateway.
   if (c.zeroentropy_api_key) envFromConfig.ZEROENTROPY_API_KEY = c.zeroentropy_api_key;
   if (c.voyage_api_key) envFromConfig.VOYAGE_API_KEY = c.voyage_api_key;
+  // v0.41.31.0 — opencode-go (Zen) per-task router for cheap/free model
+  // routing (e.g. propose_takes extractor). Same env-mirror pattern as
+  // voyage_api_key / zeroentropy_api_key above.
+  if (c.opencode_go_api_key) envFromConfig.OPENCODE_GO_API_KEY = c.opencode_go_api_key;
 
   // v0.32 codex finding #4+#5 fix: thread local-server _BASE_URL env vars
   // into base_urls so the gateway hits the user's configured port. Without

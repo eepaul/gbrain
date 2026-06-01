@@ -161,6 +161,11 @@ export async function defaultJudge(input: {
     messages: [{ role: 'user', content: prompt }],
     model: 'claude-haiku-4-5',
     maxTokens: 100,
+    // v0.41.31.0: defeat SDK + proxy retry amplification (matches the
+    // posture across propose_takes / grade_takes / calibration_profile).
+    // Voice gate is hardcoded to Haiku-direct so retry-stacking is
+    // unlikely in practice, but uniform posture beats one-off exemptions.
+    maxRetries: 0,
   });
   return parseJudgeOutput(result.text);
 }

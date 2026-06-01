@@ -2,6 +2,138 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.31.0] - 2026-05-31
+
+**propose_takes 现在能跑了 — 用免费的 GLM-5.1 模型抽 takes,而不是每次 cycle 烧 Anthropic credits 在同一页上重跑。** v0.41.30 关停 calibration trio 是急救措施(雪崩不能不止),但 propose_takes 这个 phase 本来就有价值:它是 brain 里所有 prediction / judgment / bet 类 claim 的捕捉口。这次把它从 "碰一下就烧钱" 变成 "便宜可用",并把 v0.41.30 的雪崩根治、整套 consumer 工具一起 ship。
+
+最直接的用户故事:你有一堆 markdown 笔记里散落着 "I bet X" / "我觉得 Y 会失败" / "这家公司 18 个月内会被收购" 这种 gradeable claim。以前 calibration 抓不出来,即使抓了也写不进 takes fence,即使写了也烧 Sonnet 烧到崩。现在:
+
+1. 用免费的 opencode-go 路由把 propose_takes 跑起来,抽出 proposals
+2. `gbrain takes propose` 命令 review proposals
+3. 接受好的进 takes fence,grade 6 个月后再回头
+
+5 页探针在真实 brain 跑出来的数据:**GLM-5.1 100% parse_ok、12.8 秒中位延迟、5.4 proposals/页**。对比 deepseek-v4-flash 5K-10K 中等长度页直接 reasoning 爆 token 输出空,kimi-k2.6 长尾 503,Anthropic Sonnet 烧钱。GLM-5.1 是数据上的明显赢家。
+
+## 怎么用
+
+```bash
+# 1. 注册 opencode-go key (file plane)
+gbrain config set opencode_go_api_key sk-...
+
+# 2. 把 propose_takes 路由到 GLM-5.1 (DB plane)
+gbrain config set models.propose_takes opencode-go:glm-5.1
+
+# 3. 开 calibration trio
+gbrain config set cycle.calibration.enabled true
+
+# 4. (可选) grade_takes 和 calibration_profile patterns 也可以路由出去
+gbrain config set models.grade_takes opencode-go:glm-5.1
+gbrain config set models.calibration_profile opencode-go:glm-5.1
+```
+
+不配后两个,grade_takes / calibration_profile 默认走 `cfg.chat_model`(通常是 Anthropic Sonnet),触发频率低,成本几分钱/cycle。voice gate 永远走 Haiku(deliberate,user-facing 文本质量需要稳),bias-tags 永远走 cfg.chat_model(internal label,不暴露 modelHint)。
+
+## 关键探针数据
+
+| 模型 | parse_ok | 中位延迟 | proposals/页 | 备注 |
+|---|---|---|---|---|
+| **glm-5.1** | **5/5** | **12.8s** | **5.4** | 全胜,推荐主用 |
+| qwen3.6-plus | 5/5 | 68.9s | 3.0 | 稳但慢 5x,备胎 |
+| deepseek-v4-flash | 3/5 | 48.8s | 3.0 | 5-10K 页 reasoning 爆 token |
+| kimi-k2.6 | 2/5 | 66.6s | 2.0 | 长尾 503,5K 截断 |
+
+## 什么也一起跑通了 (v0.41.30 staged 整合)
+
+**雪崩根治** —— v0.41.30 关停 calibration trio 是急救,这次把两条腿一起修透:
+- 第一条腿:`[]` 不缓存。Migration v108 + sentinel 行(`status='empty'`)。下次 cycle 的 idempotency SELECT 命中,LLM 不重跑
+- 第二条腿:throw 不缓存。Consecutive-failure circuit breaker(默认 3),provider/proxy down 时整 phase 中止,不挨页 9× retry 放大
+
+**`gbrain takes propose` consumer** —— propose_takes 的 review 半边以前不存在(只有 write,没有 read/accept)。三模式:
+- `gbrain takes propose` 列出 pending proposals
+- `gbrain takes propose --accept <id>` 接受,写进 page 的 takes fence
+- `gbrain takes propose --reject <id>` 驳回,保留 audit history
+
+## 两个 latent bug 顺带修了
+
+- **`maxTokens: 2048 → 8192`**:R1-reasoning 模型(opencode-go 上几乎全是)把 token 预算都吃在 reasoning_content 上,2048 在 5K+ 页就开始截断 JSON 输出。8192 给 reasoning + JSON 留余地
+- **`maxRetries: 0` 全 calibration 一致**:Vercel AI SDK 默认 2 retry。Proxy 也 retry 时 9× 放大。Calibration 自己已有 circuit breaker,SDK auto-retry 纯放大没有价值。全 4 个 calibration LLM 调用都打 0
+
+## 已知本机环境问题
+
+`bun test` 全 batch 在本机环境会出 5 个 dimension mismatch fail(`runPhaseConsolidate` 测试),来源是 v0.41.30 改动 trigger 的 cross-file gateway state pollution(checkpoint 已记录:"本机 8-shard 全量套件会 wedge")。**每个 file 单独跑都过**,CI 走 4-shard 分离 process 不会撞这个。可重复修,但不阻塞 ship。
+
+## Itemized changes
+
+### Recipes + gateway
+
+- New recipe `opencode-go` (`src/core/ai/recipes/opencode-go.ts`). OpenAI-compatible router for 15 Chinese open-weights frontier models (GLM, DeepSeek, Qwen, Kimi, MiniMax, MiMo, Hunyuan). chat-only touchpoint, no embedding. `OPENCODE_GO_API_KEY` env / `opencode_go_api_key` file-plane mirror.
+- `qwen3.7-max` intentionally omitted from the model list — opencode-go's openai-compat router returns `"Model qwen3.7-max is not supported for format oa-compat"` on `/v1/chat/completions`. Pinned absent in `test/ai/recipe-opencode-go.test.ts` so a catalog refresh that adds it back without verifying the oa-compat route fails the test.
+- `ChatOpts.maxRetries?: number` added to `gateway.chat()` interface (`src/core/ai/gateway.ts`). Mirrors the existing `embed()` passthrough; threaded into Vercel AI SDK's `generateText({maxRetries})`. Default behavior (undefined) unchanged.
+- `opencode_go_api_key` added to `GBrainConfig` interface (`src/core/config.ts`) + env mirror in `buildGatewayConfig` (`src/cli.ts`).
+
+### Calibration trio model routing
+
+- New config keys:
+  - `models.propose_takes` (+ `GBRAIN_PROPOSE_TAKES_MODEL` env) → propose_takes extractor modelHint
+  - `models.grade_takes` (+ `GBRAIN_GRADE_TAKES_MODEL` env) → grade_takes defaultJudge modelHint
+  - `models.calibration_profile` (+ `GBRAIN_CALIBRATION_PROFILE_MODEL` env) → calibration_profile defaultPatternsGenerator modelHint
+- All three wire through `cycle.ts`'s per-phase dispatch. Deliberately do NOT route through `resolveModel()`'s 6-tier chain — these phases want explicit opt-in to a benchmarked model, not `models.default` bleed-in.
+- Scope intentionally narrow:
+  - `defaultBiasTagsGenerator` (calibration_profile bias-tags) does NOT accept modelHint — uses `cfg.chat_model`. Bias tags are internal labels, not user-facing text.
+  - `defaultJudge` in `voice-gate.ts` hardcoded to `claude-haiku-4-5`. Voice gate is "this text sounds friendly" — needs a stable known-good voice.
+
+### maxTokens + maxRetries hardening
+
+- `propose-takes.ts` defaultExtractor: `maxTokens: 2048 → 8192`, `maxRetries: 0`
+- `grade-takes.ts` defaultJudge: `maxRetries: 0` (maxTokens stays 600 — short prompt + short verdict)
+- `calibration-profile.ts` defaultPatternsGenerator: `maxRetries: 0`
+- `calibration-profile.ts` defaultBiasTagsGenerator: `maxRetries: 0`
+- `voice-gate.ts` defaultJudge: `maxRetries: 0` (Haiku-direct so retry-stacking unlikely, but uniform posture beats exemptions)
+
+### Avalanche fix wave (v0.41.30 staged work)
+
+- **Migration v108** (`take_proposals_status_empty_sentinel`): widen CHECK to include `'empty'`. Single SQL statement on both Postgres + PGLite. Idempotent.
+- **`propose-takes.ts`**: negative-result sentinel branch (writes `status='empty'` row when extractor returns `[]`). `take_proposals_pending_idx (WHERE status='pending')` excludes sentinels from `gbrain takes propose`. `BaseCyclePhase.run()` doesn't wrap a transaction, so per-page autocommit means SIGKILL recovery converges.
+- **`propose-takes.ts`**: consecutive-failure circuit breaker. `maxConsecutiveExtractorFailures` (default 3) aborts the phase early with `status='warn'` + `circuit_broken: true` when the LLM provider/proxy is down. Throws NOT cached (may be transient).
+- **`gbrain takes propose` consumer** (`src/commands/takes.ts`): three modes — list pending, accept (reuses cmdAdd's upsertTakeRow → writeBody → addTakesBatch), reject (preserved as audit history). 8 PGLite E2E cases in `test/e2e/takes-propose.test.ts`.
+- **`cycle.ts` gate semantics rewritten**: default-off rationale clarified (no longer "avalanche", now "cold-start spend + prompt value unverified" → opt-in).
+
+### Tests
+
+- `test/ai/recipe-opencode-go.test.ts` (11 cases): registry shape, chat-only touchpoint, probe winner first, models list invariants, default auth + AIConfigError, setup_hint discoverability.
+- `test/propose-takes-default-extractor.test.ts` (5 cases): `maxTokens: 8192`, `maxRetries: 0`, modelHint propagation, conditional spread.
+- `test/calibration-trio-default-extractors.test.ts` (14 cases): full coverage across `defaultJudge` (grade), `defaultPatternsGenerator` + `defaultBiasTagsGenerator` (calibration_profile), `defaultJudge` (voice-gate). Pins which sites accept modelHint and which deliberately don't.
+
+### Schema
+
+- `take_proposals.status` CHECK widened: `pending | accepted | rejected | empty` (was `pending | accepted | rejected`). schema.sql + pglite-schema.ts + schema-embedded.ts kept in sync (`bun run build:schema`).
+
+### Probe artifacts (not committed)
+
+Head-to-head probe script + raw JSONL data at `/tmp/opencode/probe-propose-takes/` for re-runnable verification. Pages: `research/short-term-alpha`, `prompts/distilled/compare-ps3838-direct-vs-oddspapi-pinnacle`, `decisions/2026-05-30-venue-and-mapping-model`, `decisions/extract-sports-market-processor`, `research/pinnacle-fair-price-bounded-filter/.../cuttlefish_ours_delay_headline`. 5 pages × 4 models = 20 calls.
+
+## To take advantage of v0.41.31.0
+
+`gbrain upgrade` should pick this up automatically. If `gbrain doctor` warns:
+
+1. Apply pending migrations: `gbrain apply-migrations --yes` (covers v108).
+2. Set your opencode-go API key (get one at https://opencode.ai/):
+   ```bash
+   gbrain config set opencode_go_api_key sk-...
+   ```
+3. Route propose_takes to GLM-5.1:
+   ```bash
+   gbrain config set models.propose_takes opencode-go:glm-5.1
+   ```
+4. Warm the cache before enabling auto-cycle (recommended):
+   ```bash
+   gbrain dream --phase propose_takes
+   gbrain takes propose           # review
+   gbrain takes propose --accept <id>
+   gbrain config set cycle.calibration.enabled true
+   ```
+5. If `bun test` shows 5 dimension-mismatch failures on `runPhaseConsolidate` in your dev env, run each test file individually — they pass in isolation. CI's 4-shard distribution avoids the cross-file gateway state pollution. Open an issue if you have a clean repro.
+
 ## [0.41.30.0] - 2026-05-30
 
 **The autopilot cycle no longer burns LLM tokens on the broken calibration

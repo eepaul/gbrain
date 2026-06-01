@@ -145,6 +145,13 @@ export interface ProposeTakesOpts extends BasePhaseOpts {
   model?: string;
   /** Skip pages that already have a complete takes fence. Default: true. */
   skipPagesWithFence?: boolean;
+  /**
+   * v0.41.30.0 — abort the phase after this many CONSECUTIVE extractor throws.
+   * Bounds the throw-storm avalanche when the LLM provider/proxy is down (every
+   * call fails the same way). A single bad page that throws then a good page
+   * that succeeds resets the counter. Default 3.
+   */
+  maxConsecutiveExtractorFailures?: number;
 }
 
 export interface ProposeTakesResult {
@@ -152,6 +159,24 @@ export interface ProposeTakesResult {
   cache_hits: number;
   cache_misses: number;
   proposals_inserted: number;
+  /**
+   * v0.41.30.0 — count of negative-result sentinel rows written this run.
+   * When the extractor returns zero gradeable claims for a page, the phase
+   * writes ONE sentinel row (status='empty') so the idempotency SELECT hits
+   * next cycle instead of re-spending the LLM on the same page forever.
+   */
+  sentinels_written: number;
+  /** v0.41.30.0 — count of pages whose extractor call threw (not []). */
+  extractor_failures: number;
+  /**
+   * v0.41.30.0 — true when the consecutive-failure circuit breaker tripped and
+   * the phase aborted early. Distinct from the [] sentinel path: a THROW is
+   * NOT cached (it may be transient — a provider/proxy outage), so the page
+   * retries next cycle. The breaker just stops the phase from grinding every
+   * remaining page through a down provider (3 retries each) — that throw-storm
+   * is the other half of the original token avalanche.
+   */
+  circuit_broken: boolean;
   budget_exhausted: boolean;
   warnings: string[];
 }
@@ -215,10 +240,15 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
  * and parses the JSON array output. Returns [] on parse failure (logged as
  * warning, not thrown — one bad page must not abort the phase).
  *
- * Stub-prompt note: the v0.36.1.0 ship-state prompt is a placeholder. Real
- * extractor lands when T19 corpus build produces the tuned prompt. Until
- * then, the production extractor returns whatever the stub LLM produces —
- * empirically often a sparse list or [].
+ * Prompt note (v0.41.30.0): EXTRACT_TAKES_PROMPT is a real extraction prompt
+ * (worked examples + NOT-gradeable list + conviction-inference rules), not a
+ * one-line stub. It was validated against the synthetic fixture corpus per the
+ * header note; its precision on an arbitrary brain is unverified, so accepted
+ * proposals always pass through human review (`gbrain takes propose`) before
+ * they reach the canonical takes fence. A [] return is EXPECTED and correct for
+ * the many pages that carry no gradeable claims — the phase caches that
+ * negative via a sentinel row (see the proposals-write branch below) so a
+ * zero-claim page is never re-extracted on the next cycle.
  */
 export async function defaultExtractor(
   input: Parameters<ProposeTakesExtractor>[0],
@@ -230,7 +260,21 @@ export async function defaultExtractor(
   const result = await gatewayChat({
     messages: [{ role: 'user', content: prompt }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
-    maxTokens: 2048,
+    // v0.41.31.0: bumped 2048 → 8192. Reasoning models (R1-style CoT) on the
+    // opencode-go endpoint consume the budget on `reasoning_content` before
+    // emitting `content` — at 2048 even mid-length pages (5-10K chars) hit
+    // `finish_reason: 'length'` with an empty content string. 8192 covers
+    // reasoning + the JSON proposals array for 19K-char pages with the GLM
+    // / Qwen / DeepSeek variants we benchmarked. Non-reasoning models
+    // ignore the extra ceiling.
+    maxTokens: 8192,
+    // v0.41.31.0: defeat SDK retry amplification. Vercel AI SDK defaults to
+    // 2 retries; when the provider is behind a proxy that ALSO retries,
+    // a single transient blip becomes 9 calls (SDK 3 attempts × proxy 3
+    // attempts). propose_takes is bounded by the per-cycle circuit breaker
+    // (maxConsecutiveExtractorFailures, default 3) — that's the right
+    // back-off surface, not SDK auto-retry.
+    maxRetries: 0,
   });
 
   // ChatResult.text is already the concatenated text content.
@@ -309,11 +353,17 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
+    const maxConsecutiveFailures = opts.maxConsecutiveExtractorFailures ?? 3;
+    let consecutiveFailures = 0;
+
     const result: ProposeTakesResult = {
       pages_scanned: 0,
       cache_hits: 0,
       cache_misses: 0,
       proposals_inserted: 0,
+      sentinels_written: 0,
+      extractor_failures: 0,
+      circuit_broken: false,
       budget_exhausted: false,
       warnings: [],
     };
@@ -371,7 +421,12 @@ class ProposeTakesPhase extends BaseCyclePhase {
         break;
       }
 
-      // Call the extractor. Errors on a single page log a warning but do not abort.
+      // Call the extractor. A single-page throw logs a warning and continues;
+      // a RUN of consecutive throws (provider/proxy outage) trips the circuit
+      // breaker so the phase doesn't grind every remaining page through a down
+      // provider — that throw-storm (each call retries 3x before giving up) is
+      // the other half of the original token avalanche. Throws are NOT cached
+      // (they may be transient), so a circuit-broken page retries next cycle.
       let proposals: ProposedTake[];
       try {
         proposals = await extractor({
@@ -383,6 +438,50 @@ class ProposeTakesPhase extends BaseCyclePhase {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);
+        result.extractor_failures += 1;
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          result.circuit_broken = true;
+          result.warnings.push(
+            `circuit breaker tripped after ${consecutiveFailures} consecutive extractor failures ` +
+            `(likely a provider/proxy outage) — aborting at page ${result.pages_scanned}/${pages.length}. ` +
+            `Unprocessed pages retry next cycle; no throws are cached.`,
+          );
+          break;
+        }
+        continue;
+      }
+      // Extractor succeeded — reset the consecutive-failure streak.
+      consecutiveFailures = 0;
+
+      // v0.41.30.0 — negative-result sentinel. The extractor found NO
+      // gradeable claims on this page. Pre-fix, the loop below wrote nothing,
+      // so the idempotency SELECT missed this (source_id, page_slug,
+      // content_hash, prompt_version) forever and re-spent the LLM on it every
+      // cycle — the unbounded token avalanche that drove the calibration trio
+      // to be gated off by default. Write ONE sentinel row (status='empty') so
+      // next cycle's SELECT (which does NOT filter by status) hits and skips.
+      // take_proposals_pending_idx (WHERE status='pending') excludes sentinels
+      // from `gbrain takes propose`. NOT-NULL columns get inert placeholders;
+      // the row is a processed-marker, never a real proposal.
+      if (proposals.length === 0) {
+        await engine.executeRaw(
+          `INSERT INTO take_proposals
+             (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+              status, claim_text, kind, holder, weight, dedup_against_fence_rows, model_id)
+           VALUES ($1, $2, $3, $4, $5, 'empty', '(no gradeable claims)', 'take', 'brain', 0, $6, $7)
+           ON CONFLICT (source_id, page_slug, content_hash, prompt_version) DO NOTHING`,
+          [
+            sourceId,
+            page.slug,
+            ch,
+            promptVersion,
+            proposalRunId,
+            JSON.stringify(existingTakes),
+            opts.model ?? 'claude-sonnet-4-6',
+          ],
+        );
+        result.sentinels_written += 1;
         continue;
       }
 
@@ -446,9 +545,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
     });
 
     return {
-      summary: `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals (run ${proposalRunId})`,
+      summary: `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals, ${result.sentinels_written} empty, ${result.extractor_failures} failed${result.circuit_broken ? ' (circuit broken)' : ''} (run ${proposalRunId})`,
       details: { ...result, proposal_run_id: proposalRunId, prompt_version: promptVersion },
-      status: result.budget_exhausted ? 'warn' : 'ok',
+      status: result.budget_exhausted || result.circuit_broken ? 'warn' : 'ok',
     };
   }
 }

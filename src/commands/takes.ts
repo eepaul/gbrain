@@ -525,6 +525,170 @@ async function cmdCalibration(engine: BrainEngine, args: string[]): Promise<void
   }
 }
 
+/**
+ * v0.41.30.0 — `gbrain takes propose` consumer for the propose_takes cycle
+ * phase queue (take_proposals). The phase writes gradeable-claim proposals;
+ * this command is the human review surface that promotes accepted proposals
+ * into the page's takes fence (the only path from queue to canonical takes).
+ *
+ *   takes propose [--page <slug>] [--source-id X] [--limit N] [--json]
+ *                                          List pending proposals
+ *   takes propose --accept <id> [--weight W] [--since YYYY-MM] [--by <name>] [--dir P]
+ *                                          Promote a proposal to the page's takes fence
+ *   takes propose --reject <id> [--by <name>]
+ *                                          Mark a proposal rejected (stays as audit history)
+ *
+ * status='empty' sentinel rows (the negative-result cache markers written when
+ * the extractor found no claims) are never listed or actionable — the list
+ * filters status='pending', and accept/reject refuse non-pending rows.
+ */
+interface ProposalRow {
+  id: number;
+  source_id: string;
+  page_slug: string;
+  claim_text: string;
+  kind: string;
+  holder: string;
+  weight: number;
+  domain: string | null;
+  status: string;
+  proposal_run_id: string;
+  proposed_at: string;
+}
+
+async function cmdPropose(engine: BrainEngine, args: string[]): Promise<void> {
+  const acceptId = flagValue(args, '--accept');
+  const rejectId = flagValue(args, '--reject');
+  if (acceptId && rejectId) {
+    console.error('Error: --accept and --reject are mutually exclusive.');
+    process.exit(1);
+  }
+
+  // ── Accept ────────────────────────────────────────────────────────
+  if (acceptId !== undefined) {
+    const id = parseInt(acceptId, 10);
+    if (!Number.isFinite(id)) { console.error(`Invalid proposal id "${acceptId}".`); process.exit(1); }
+    const rows = await engine.executeRaw<ProposalRow>(
+      `SELECT id, source_id, page_slug, claim_text, kind, holder, weight, domain, status, proposal_run_id, proposed_at
+       FROM take_proposals WHERE id = $1 LIMIT 1`,
+      [id],
+    );
+    const p = rows[0];
+    if (!p) { console.error(`Proposal #${id} not found.`); process.exit(1); }
+    if (p.status !== 'pending') {
+      console.error(
+        p.status === 'empty'
+          ? `Proposal #${id} is a negative-result sentinel, not a real proposal. Nothing to accept.`
+          : `Proposal #${id} is already ${p.status}. Only pending proposals can be accepted.`,
+      );
+      process.exit(1);
+    }
+
+    const slug = p.page_slug;
+    const claim = p.claim_text;
+    // proposal.kind is stored TEXT; coerce to a valid TakeKind (defensive — the
+    // extractor already coerces, but a hand-edited row could carry anything).
+    const kind: TakeKind =
+      p.kind === 'fact' || p.kind === 'take' || p.kind === 'bet' || p.kind === 'hunch' ? p.kind : 'take';
+    const holder = p.holder || 'brain';
+    const weight = ensureFloat(flagValue(args, '--weight'), Number(p.weight));
+    const since = flagValue(args, '--since');
+    // Provenance: link the resulting take back to the proposal run. domain is
+    // extraction-only metadata (the take fence has no domain column) so it
+    // rides along in the source tag for traceability.
+    const source = `proposal:${p.proposal_run_id}${p.domain ? ` domain:${p.domain}` : ''}`;
+    const acted_by = flagValue(args, '--by') ?? 'garry';
+    const dirArg = flagValue(args, '--dir');
+    const brainDir = await resolveBrainDir(engine, dirArg ?? null);
+
+    await withPageLock(slug, async () => {
+      const path = pageFilePath(brainDir, slug);
+      const body = readBodyOrEmpty(path);
+      const { body: nextBody, rowNum } = upsertTakeRow(body, {
+        claim, kind, holder, weight, source, sinceDate: since, active: true,
+      });
+      writeBody(path, nextBody);
+
+      const pageId = await getPageId(engine, slug);
+      await engine.addTakesBatch([{
+        page_id: pageId, row_num: rowNum, claim, kind, holder, weight,
+        since_date: since, source, active: true, superseded_by: null,
+      }]);
+
+      // Mark the proposal accepted + record which fence row it became.
+      await engine.executeRaw(
+        `UPDATE take_proposals
+           SET status = 'accepted', promoted_row_num = $2, acted_at = now(), acted_by = $3
+         WHERE id = $1`,
+        [id, rowNum, acted_by],
+      );
+      console.log(`Accepted proposal #${id} → take #${rowNum} on ${slug}.`);
+    });
+    return;
+  }
+
+  // ── Reject ────────────────────────────────────────────────────────
+  if (rejectId !== undefined) {
+    const id = parseInt(rejectId, 10);
+    if (!Number.isFinite(id)) { console.error(`Invalid proposal id "${rejectId}".`); process.exit(1); }
+    const acted_by = flagValue(args, '--by') ?? 'garry';
+    const updated = await engine.executeRaw<{ status: string }>(
+      `UPDATE take_proposals
+         SET status = 'rejected', acted_at = now(), acted_by = $2
+       WHERE id = $1 AND status = 'pending'
+       RETURNING status`,
+      [id, acted_by],
+    );
+    if (updated.length === 0) {
+      // Disambiguate: not-found vs not-pending.
+      const exists = await engine.executeRaw<{ status: string }>(
+        `SELECT status FROM take_proposals WHERE id = $1 LIMIT 1`, [id],
+      );
+      if (exists.length === 0) console.error(`Proposal #${id} not found.`);
+      else console.error(`Proposal #${id} is ${exists[0]!.status}, not pending — nothing to reject.`);
+      process.exit(1);
+    }
+    console.log(`Rejected proposal #${id}.`);
+    return;
+  }
+
+  // ── List (default) ──────────────────────────────────────────────────
+  const json = flagPresent(args, '--json');
+  const page = flagValue(args, '--page');
+  const sourceId = flagValue(args, '--source-id');
+  const limit = parseInt(flagValue(args, '--limit') ?? '50', 10);
+
+  // status='pending' filter naturally excludes 'empty' sentinels and
+  // already-acted (accepted/rejected/superseded) rows.
+  const where: string[] = [`status = 'pending'`];
+  const params: unknown[] = [];
+  if (sourceId) { params.push(sourceId); where.push(`source_id = $${params.length}`); }
+  if (page) { params.push(page); where.push(`page_slug = $${params.length}`); }
+  params.push(Number.isFinite(limit) && limit > 0 ? limit : 50);
+  const rows = await engine.executeRaw<ProposalRow>(
+    `SELECT id, source_id, page_slug, claim_text, kind, holder, weight, domain, status, proposal_run_id, proposed_at
+     FROM take_proposals
+     WHERE ${where.join(' AND ')}
+     ORDER BY proposed_at DESC
+     LIMIT $${params.length}`,
+    params,
+  );
+
+  if (json) { console.log(JSON.stringify(rows, null, 2)); return; }
+  if (rows.length === 0) {
+    console.log(`No pending proposals${page ? ` for ${page}` : ''}${sourceId ? ` in source ${sourceId}` : ''}.`);
+    return;
+  }
+  console.log(`# Pending take proposals (${rows.length})\n`);
+  for (const r of rows) {
+    const w = Number(r.weight).toFixed(2);
+    const dom = r.domain ? ` • ${r.domain}` : '';
+    console.log(`#${r.id} [${r.kind} • ${r.holder} • w=${w}${dom}]  ${r.page_slug}`);
+    console.log(`  ${r.claim_text}`);
+    console.log(`  accept: gbrain takes propose --accept ${r.id}   |   reject: gbrain takes propose --reject ${r.id}\n`);
+  }
+}
+
 // --- Dispatcher ---
 
 export async function runTakes(engine: BrainEngine, args: string[]): Promise<void> {
@@ -551,6 +715,12 @@ Subcommands:
                                           Aggregate calibration scorecard (v0.30.0)
   takes calibration [<holder>] [--bucket-size 0.1] [--json]
                                           Calibration curve binned by stated weight (v0.30.0)
+  takes propose [--page <slug>] [--source-id X] [--limit N] [--json]
+                                          List pending proposals from the propose_takes phase
+  takes propose --accept <id> [--weight W] [--since YYYY-MM] [--by <name>]
+                                          Promote a proposal into the page's takes fence
+  takes propose --reject <id> [--by <name>]
+                                          Mark a proposal rejected (kept as audit history)
 
 Common flags:
   --dir <path>    Override the brain directory (default: sync.repo_path config)
@@ -570,6 +740,7 @@ Common flags:
     case 'resolve':     return cmdResolve(engine, rest);
     case 'scorecard':   return cmdScorecard(engine, rest);
     case 'calibration': return cmdCalibration(engine, rest);
+    case 'propose':     return cmdPropose(engine, rest);
     case 'revisit':     return cmdRevisit(engine, rest);
     case 'extract':     return cmdExtract(engine, rest);
     default:

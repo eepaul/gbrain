@@ -324,6 +324,13 @@ export async function defaultJudge(input: {
     messages: [{ role: 'user', content: prompt }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
     maxTokens: 600,
+    // v0.41.31.0: defeat SDK + proxy retry amplification. Same posture
+    // as propose-takes defaultExtractor — SDK auto-retry layered on top
+    // of a proxy that also retries inflates one transient blip into 9
+    // calls. Calibration phases have their own per-cycle bounding (judge
+    // throws degrade to "unresolvable" + low confidence so the row still
+    // lands in the cache); SDK auto-retry adds no value here.
+    maxRetries: 0,
   });
   const parsed = parseJudgeOutput(result.text);
   if (!parsed) {

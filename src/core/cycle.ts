@@ -1838,21 +1838,34 @@ export async function runCycle(
         } as never;
 
         // v0.41.30.0 — the v0.36.1.0 calibration trio is OFF by default in the
-        // automatic cycle. Two reasons:
-        //   1. The extractor prompts are stubs (see the prompt-tuning note in
-        //      cycle/propose-takes.ts) — empirically they return [] for most
-        //      pages.
-        //   2. Negative results are never cached. When the extractor returns
-        //      no gradeable claims for a page, the loop writes no take_proposals
-        //      row, so the idempotency SELECT (propose-takes.ts) misses that
-        //      page forever and the LLM re-runs on it every single cycle. On a
-        //      multi-thousand-page brain that is an unbounded token avalanche:
-        //      the phase blows past the cycle timeout, gets SIGKILLed mid-run,
-        //      makes zero durable progress, and the next cycle repeats it.
+        // automatic cycle. The token-avalanche that originally forced this gate
+        // is FIXED on both vectors:
+        //   - []-return vector: propose_takes writes a status='empty' sentinel
+        //     row when the extractor finds no gradeable claims, so the
+        //     idempotency SELECT hits next cycle and a zero-claim page is LLM'd
+        //     at most once per (content_hash, prompt_version) instead of every
+        //     cycle forever (migration v108 + sentinel branch in propose-takes.ts).
+        //   - throw-storm vector: when the LLM provider/proxy is down every
+        //     call throws (after 3 retries each); a consecutive-failure circuit
+        //     breaker aborts the phase after 3 throws in a row instead of
+        //     grinding all 100 pages through the down provider. Throws are NOT
+        //     cached (they may be transient) so pages retry once it recovers.
+        //
+        // The default stays OFF deliberately, NOT because of the avalanche:
+        //   1. Cold-start warmup still spends real tokens once per page to seed
+        //      the cache. On a large brain behind a slow proxy that first pass
+        //      is real money, so it should be a deliberate opt-in, not a
+        //      surprise on every autopilot tick.
+        //   2. The extraction prompt's precision on an arbitrary brain is
+        //      unverified — proposals are write-only until reviewed.
+        //
         // The phases stay in ALL_PHASES so explicit `gbrain dream --phase
-        // propose_takes` and the per-phase unit tests still exercise them. To
-        // re-enable them in the automatic cycle once the stub is replaced:
-        //   gbrain config set cycle.calibration.enabled true
+        // propose_takes` and the per-phase unit tests still exercise them.
+        // To turn calibration on (recommended order):
+        //   1. Warm the cache deliberately:  gbrain dream --phase propose_takes
+        //   2. Review what it proposed:       gbrain takes propose
+        //   3. Accept the good ones:          gbrain takes propose --accept <id>
+        //   4. Enable in the automatic cycle: gbrain config set cycle.calibration.enabled true
         const calibEnabledRaw = await engine.getConfig('cycle.calibration.enabled');
         const calibrationEnabled =
           calibEnabledRaw != null &&
@@ -1870,7 +1883,27 @@ export async function runCycle(
           progress.start('cycle.propose_takes');
           if (calibrationEnabled) {
             const { runPhaseProposeTakes } = await import('./cycle/propose-takes.ts');
-            const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, { repoPath: opts.brainDir }) as Promise<PhaseResult>);
+            // v0.41.31.0: per-task model override for the propose_takes
+            // extractor via `gbrain config set models.propose_takes
+            // <provider:model>` (DB plane) or `GBRAIN_PROPOSE_TAKES_MODEL`
+            // env. Lets users route the extractor to a cheap / free /
+            // non-Anthropic model (e.g. `opencode-go:glm-5.1` — the
+            // head-to-head probe winner: 100% parse_ok across 1.3K-19K
+            // page sizes, 12.8s median latency, 5.4 proposals/page) WITHOUT
+            // flipping the whole chat tier. We deliberately do NOT route
+            // through resolveModel()'s 6-tier chain here — the chain would
+            // bleed `models.default` into propose_takes, but propose_takes
+            // is single-shot strict-JSON extraction and wants explicit opt-
+            // in to a model that's actually been benchmarked on this task.
+            // Unset → defaultExtractor's gateway.chat() uses cfg.chat_model
+            // (Anthropic Sonnet by default), preserving prior behavior.
+            const configuredModel = (await engine.getConfig('models.propose_takes'))?.trim()
+              || process.env.GBRAIN_PROPOSE_TAKES_MODEL?.trim()
+              || undefined;
+            const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, {
+              repoPath: opts.brainDir,
+              ...(configuredModel ? { model: configuredModel } : {}),
+            }) as Promise<PhaseResult>);
             result.duration_ms = duration_ms;
             phaseResults.push(result);
           } else {
@@ -1885,7 +1918,19 @@ export async function runCycle(
           progress.start('cycle.grade_takes');
           if (calibrationEnabled) {
             const { runPhaseGradeTakes } = await import('./cycle/grade-takes.ts');
-            const { result, duration_ms } = await timePhase(() => runPhaseGradeTakes(calibrationCtx, {}) as Promise<PhaseResult>);
+            // v0.41.31.0: same per-task model override as propose_takes.
+            // `gbrain config set models.grade_takes <provider:model>` or
+            // `GBRAIN_GRADE_TAKES_MODEL` env. Unset → defaultJudge falls
+            // through to grade-takes.ts hardcoded `claude-sonnet-4-6`,
+            // preserving prior behavior. NOT routed through resolveModel
+            // (same rationale as propose_takes: grade_takes wants explicit
+            // opt-in to a benchmarked model, not models.default bleed-in).
+            const configuredGradeModel = (await engine.getConfig('models.grade_takes'))?.trim()
+              || process.env.GBRAIN_GRADE_TAKES_MODEL?.trim()
+              || undefined;
+            const { result, duration_ms } = await timePhase(() => runPhaseGradeTakes(calibrationCtx, {
+              ...(configuredGradeModel ? { model: configuredGradeModel } : {}),
+            }) as Promise<PhaseResult>);
             result.duration_ms = duration_ms;
             phaseResults.push(result);
           } else {
@@ -1900,7 +1945,23 @@ export async function runCycle(
           progress.start('cycle.calibration_profile');
           if (calibrationEnabled) {
             const { runPhaseCalibrationProfile } = await import('./cycle/calibration-profile.ts');
-            const { result, duration_ms } = await timePhase(() => runPhaseCalibrationProfile(calibrationCtx, {}) as Promise<PhaseResult>);
+            // v0.41.31.0: per-task model override for the pattern-statement
+            // generator. Scope is INTENTIONALLY narrow: opts.model only
+            // reaches `defaultPatternsGenerator` (pattern statements that
+            // the calibration page surfaces). `defaultBiasTagsGenerator`
+            // takes no modelHint (always cfg.chat_model — bias tags are
+            // internal labels, not user-facing). `defaultJudge` in
+            // voice-gate.ts hardcodes Haiku (voice gate is "this text
+            // sounds friendly" — deliberately small + fast + stable).
+            // Widening to bias-tags / voice-gate would need a public-
+            // interface change; deferred to a follow-up wave with quality
+            // data to justify it.
+            const configuredProfileModel = (await engine.getConfig('models.calibration_profile'))?.trim()
+              || process.env.GBRAIN_CALIBRATION_PROFILE_MODEL?.trim()
+              || undefined;
+            const { result, duration_ms } = await timePhase(() => runPhaseCalibrationProfile(calibrationCtx, {
+              ...(configuredProfileModel ? { model: configuredProfileModel } : {}),
+            }) as Promise<PhaseResult>);
             result.duration_ms = duration_ms;
             phaseResults.push(result);
           } else {

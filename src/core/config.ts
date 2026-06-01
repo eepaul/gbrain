@@ -49,7 +49,16 @@ export interface GBrainConfig {
    * merges the env var here and buildGatewayConfig maps this field
    * back to VOYAGE_API_KEY in the gateway env dict.
    */
-  voyage_api_key?: string;
+   voyage_api_key?: string;
+  /**
+   * opencode-go (Zen) API key. v0.41.31.0 added the opencode-go recipe
+   * for cheap / free per-task model routing (e.g. propose_takes extractor).
+   * Recipe declares OPENCODE_GO_API_KEY in auth_env.required; loadConfig
+   * merges the env var here and buildGatewayConfig maps this field back to
+   * OPENCODE_GO_API_KEY in the gateway env dict. Same pattern as
+   * voyage_api_key / zeroentropy_api_key.
+   */
+  opencode_go_api_key?: string;
   /** AI gateway config (v0.14+). v0.36+ default: "zeroentropyai:zembed-1" / 1280 / "anthropic:claude-haiku-4-5-20251001". */
   embedding_model?: string;
   embedding_dimensions?: number;
@@ -343,7 +352,8 @@ export function loadConfig(): GBrainConfig | null {
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
     ...(process.env.ANTHROPIC_API_KEY ? { anthropic_api_key: process.env.ANTHROPIC_API_KEY } : {}),
     ...(process.env.ZEROENTROPY_API_KEY ? { zeroentropy_api_key: process.env.ZEROENTROPY_API_KEY } : {}),
-    ...(process.env.VOYAGE_API_KEY ? { voyage_api_key: process.env.VOYAGE_API_KEY } : {}),
+     ...(process.env.VOYAGE_API_KEY ? { voyage_api_key: process.env.VOYAGE_API_KEY } : {}),
+    ...(process.env.OPENCODE_GO_API_KEY ? { opencode_go_api_key: process.env.OPENCODE_GO_API_KEY } : {}),
     ...(process.env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: process.env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(process.env.GBRAIN_EMBEDDING_DIMENSIONS ? { embedding_dimensions: parseInt(process.env.GBRAIN_EMBEDDING_DIMENSIONS, 10) } : {}),
     ...(process.env.GBRAIN_EXPANSION_MODEL ? { expansion_model: process.env.GBRAIN_EXPANSION_MODEL } : {}),

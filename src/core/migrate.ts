@@ -4913,11 +4913,43 @@ export const MIGRATIONS: Migration[] = [
       END;
       $func$ LANGUAGE plpgsql;
 
-      DROP TRIGGER IF EXISTS bump_page_generation_clock_trg ON pages;
-      CREATE TRIGGER bump_page_generation_clock_trg
-        AFTER INSERT OR UPDATE OR DELETE ON pages
-        FOR EACH STATEMENT
-        EXECUTE FUNCTION bump_page_generation_clock_fn();
+        DROP TRIGGER IF EXISTS bump_page_generation_clock_trg ON pages;
+        CREATE TRIGGER bump_page_generation_clock_trg
+          AFTER INSERT OR UPDATE OR DELETE ON pages
+          FOR EACH STATEMENT
+          EXECUTE FUNCTION bump_page_generation_clock_fn();
+    `,
+  },
+  {
+    version: 108,
+    name: 'take_proposals_status_empty_sentinel',
+    // v0.41.30.0 — propose_takes negative-result cache fix. The phase recorded
+    // idempotency ONLY for pages that yield >=1 proposal: the INSERT in
+    // cycle/propose-takes.ts lives inside `for (const p of proposals)`, so a
+    // page that extracts zero gradeable claims wrote no take_proposals row.
+    // The idempotency SELECT then missed that page forever and re-ran the LLM
+    // on it every cycle — an unbounded token avalanche on multi-thousand-page
+    // brains (blows the cycle timeout, gets SIGKILLed mid-run, makes zero
+    // durable progress, repeats). Most pages legitimately have zero gradeable
+    // claims, so this bit regardless of prompt quality.
+    //
+    // Fix: propose_takes now writes a single SENTINEL row (status='empty')
+    // when the extractor returns []. The sentinel satisfies the idempotency
+    // unique index (source_id, page_slug, content_hash, prompt_version) so the
+    // next cycle's SELECT hits and skips the page. This migration widens the
+    // status CHECK to admit 'empty'. The existing take_proposals_pending_idx
+    // (WHERE status='pending') auto-excludes sentinels from the proposal
+    // queue, so `gbrain takes propose` never surfaces them.
+    //
+    // Constraint name take_proposals_status_check is Postgres' auto-assigned
+    // name for the inline CHECK on the status column; DROP IF EXISTS + re-ADD
+    // is idempotent on both fresh (5-value inline) and pre-v0.41.30 (4-value
+    // inline) brains. Mirror in schema.sql + pglite-schema.ts (fresh-install).
+    idempotent: true,
+    sql: `
+      ALTER TABLE take_proposals DROP CONSTRAINT IF EXISTS take_proposals_status_check;
+      ALTER TABLE take_proposals ADD CONSTRAINT take_proposals_status_check
+        CHECK (status IN ('pending','accepted','rejected','superseded','empty'));
     `,
   },
 ];

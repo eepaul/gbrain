@@ -141,6 +141,9 @@ export async function defaultPatternsGenerator(input: {
     messages: [{ role: 'user', content: prompt + feedbackSuffix }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
     maxTokens: 500,
+    // v0.41.31.0: defeat SDK + proxy retry amplification (matches the
+    // posture across propose_takes / grade_takes / voice_gate).
+    maxRetries: 0,
   });
   return parsePatternStatementsOutput(result.text);
 }
@@ -155,6 +158,9 @@ export async function defaultBiasTagsGenerator(patterns: string[]): Promise<stri
   const result = await gatewayChat({
     messages: [{ role: 'user', content: prompt }],
     maxTokens: 200,
+    // v0.41.31.0: defeat SDK + proxy retry amplification (matches the
+    // posture across propose_takes / grade_takes / voice_gate).
+    maxRetries: 0,
   });
   return parseBiasTagsOutput(result.text);
 }

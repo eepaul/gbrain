@@ -1162,7 +1162,11 @@ CREATE TABLE IF NOT EXISTS take_proposals (
   proposed_at                 TIMESTAMPTZ  NOT NULL DEFAULT now(),
   proposal_run_id             TEXT         NOT NULL,
   status                      TEXT         NOT NULL DEFAULT 'pending'
-                                           CHECK (status IN ('pending','accepted','rejected','superseded')),
+                                           -- 'empty' is the negative-result sentinel: propose_takes writes one
+                                           -- such row when the extractor returns zero claims, so the idempotency
+                                           -- index stops the per-cycle LLM re-spend. take_proposals_pending_idx
+                                           -- (WHERE status='pending') excludes it from the proposal queue.
+                                           CHECK (status IN ('pending','accepted','rejected','superseded','empty')),
   claim_text                  TEXT         NOT NULL,
   kind                        TEXT         NOT NULL,
   holder                      TEXT         NOT NULL,
