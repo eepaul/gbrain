@@ -1202,9 +1202,16 @@ export class PostgresEngine implements BrainEngine {
     // putPage + submitJob elsewhere in this file. Empirically verified
     // produces jsonb_typeof = 'object'.
     const sql = this.sql;
+    // Defensive heal (self-repair): if a buggy writer previously turned this
+    // row's config into a JSONB array or string (the `$1::jsonb` double-encode
+    // trap described above), then `array || object` / `string || object` would
+    // APPEND instead of key-merge and grow the row unbounded on every cycle.
+    // Coerce any non-object config back to '{}' before the merge so a single
+    // updateSourceConfig call repairs the row instead of compounding the bloat.
     const result = await sql`
       UPDATE sources
-         SET config = COALESCE(config, '{}'::jsonb) || ${sql.json(patch as Parameters<typeof sql.json>[0])}
+         SET config = (CASE WHEN jsonb_typeof(config) = 'object' THEN config ELSE '{}'::jsonb END)
+                      || ${sql.json(patch as Parameters<typeof sql.json>[0])}
        WHERE id = ${sourceId}
     `;
     return (result.count ?? 0) > 0;

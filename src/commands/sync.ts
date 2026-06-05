@@ -654,9 +654,10 @@ async function reconcileExcludesIfNeeded(
 }
 
 /**
- * Persist the new excludePatternsHash to sources.config. Uses the same
- * JSONB merge pattern as other source-config writers (matches what the
- * `strategy` field writes look like elsewhere).
+ * Persist the new excludePatternsHash to sources.config via the engine's
+ * safe single-key JSONB merge (updateSourceConfig → sql.json). Never reads or
+ * re-serializes the existing config, so it can't double-encode it into an
+ * array nor OOM on a bloated row.
  *
  * Best-effort: log + continue on failure. The hash is purely a cache key
  * for the fast path; a missed write just means the next sync re-runs the
@@ -665,15 +666,21 @@ async function reconcileExcludesIfNeeded(
 async function persistExcludesHash(
   engine: BrainEngine,
   sourceId: string,
-  currentConfig: Record<string, unknown>,
+  _currentConfig: Record<string, unknown>,
   newHash: string,
 ): Promise<void> {
   try {
-    const merged = { ...currentConfig, excludePatternsHash: newHash };
-    await engine.executeRaw(
-      `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
-      [JSON.stringify(merged), sourceId],
-    );
+    // Single-key merge via the engine's safe JSONB path. The previous impl
+    // read the whole config, {...spread} it, JSON.stringify'd it, and wrote it
+    // back through `executeRaw('... $1::jsonb', [str])`. That positional cast
+    // double-encodes into a JSONB *string*, which the next `||` merge then
+    // concatenates into a JSONB *array* (see postgres-engine.updateSourceConfig
+    // comment) — corrupting config and growing it unbounded. On a source whose
+    // config had already ballooned, the JSON.stringify + server-side `::jsonb`
+    // cast also OOMed the Postgres backend ("could not persist new hash ...
+    // Out of memory"). updateSourceConfig only touches excludePatternsHash via
+    // sql.json() and never materializes the existing config client-side.
+    await engine.updateSourceConfig(sourceId, { excludePatternsHash: newHash });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     serr(`[reconcile-excludes] could not persist new hash for ${sourceId}: ${msg.slice(0, 80)}`);
